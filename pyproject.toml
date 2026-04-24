@@ -11,6 +11,11 @@ dependencies = [
     "numpy",
     "soundfile",
     "tqdm",
+    "jiwer",
+    "datasets",
+    "transformers",
+    "torchcodec",
+    "matplotlib"
 ]
 
 [dependency-groups]
