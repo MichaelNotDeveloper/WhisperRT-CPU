@@ -1,16 +1,23 @@
-import json
 from dataclasses import dataclass, fields
 from typing import Any, Literal
-from audio_datasets import AudioTextDataset
-from transformers import WhisperProcessor, WhisperForConditionalGeneration
-from utils import asr_metrics, ModuleTimer, plot_benchmarks, BenchmarkResult
 
 import torch
 import torch.nn as nn
+from torch.profiler import ProfilerActivity, profile, record_function
+from tqdm import tqdm
+from transformers import WhisperForConditionalGeneration, WhisperProcessor
+
+from audio_datasets import AudioTextDataset
+from utils import (
+    BenchmarkResult,
+    ModuleTimer,
+    asr_metrics,
+    plot_benchmarks,
+    plot_profiler_averages,
+)
 
 
-# Code gets list of models, to be tested later on, methods as forward required to be implemented for each model,
-# to be tested later on. Results are stored in json file, to be used for report generation.
+# Models are expected to expose `model.encoder` and `model.decoder`.
 @dataclass
 class ModelsForBenchmark:
     BaseWhisper: nn.Module | None = WhisperForConditionalGeneration.from_pretrained(
@@ -18,14 +25,13 @@ class ModelsForBenchmark:
     )
     LargeWhisper: nn.Module | None = WhisperForConditionalGeneration.from_pretrained(
         "openai/whisper-large-v3"
-    )
+    ).to(dtype=torch.float)
 
 
 @dataclass
 class ProcessingOptions:
     BaseWhisper: Any = WhisperProcessor.from_pretrained("openai/whisper-base")
     LargeWhisper: Any = WhisperProcessor.from_pretrained("openai/whisper-large-v3")
-
 
 
 class Benchmark:
@@ -39,9 +45,13 @@ class Benchmark:
         self.processors = {}
         self.device = "cpu" if device == "CPU" else "cuda"
         self.dataset = AudioTextDataset(dataset_name)
+        self.profiler_activities = (
+            [ProfilerActivity.CPU]
+            if device == "CPU"
+            else [ProfilerActivity.CUDA, ProfilerActivity.CPU]
+        )
 
         for field in fields(ModelsForBenchmark):
-            print(field.name)
             self.models[field.name] = getattr(ModelsForBenchmark, field.name)
 
         for field in fields(ProcessingOptions):
@@ -58,58 +68,70 @@ class Benchmark:
         cer_hist = []
         generated_texts = []
         original_texts = []
-        
+
         encoder_timer = ModuleTimer()
         decoder_timer = ModuleTimer()
-        original_encoder_forward = encoder_timer.wrap(model.model.encoder)
-        original_decoder_forward = decoder_timer.wrap(model.model.decoder)
+        encoder_timer.wrap(model.model.encoder)
+        decoder_timer.wrap(model.model.decoder)
+        with profile(activities=self.profiler_activities, record_shapes=True) as prof:
+            with record_function("model_inference"):
+                for audio, text in tqdm(
+                    self.dataset.take(sample_size),
+                    total=sample_size,
+                    desc=f"Benchmarking {model_name}",
+                ):
+                    inputs = processor(
+                        audio["array"],
+                        sampling_rate=audio["sampling_rate"],
+                        return_tensors="pt",
+                        return_attention_mask=True,
+                    )
 
-        for audio, text in self.dataset.take(sample_size):
-            inputs = processor(
-                audio["array"],
-                sampling_rate=audio["sampling_rate"],
-                return_tensors="pt",
-                return_attention_mask=True,
-            )
+                    input_features = inputs.input_features.to(self.device)
+                    attention_mask = inputs.attention_mask.to(self.device)
 
-            input_features = inputs.input_features.to(self.device)
-            attention_mask = inputs.attention_mask.to(self.device)
+                    tokens = model.generate(
+                        input_features=input_features,
+                        attention_mask=attention_mask,
+                        language="ru",  # или "ru" для golos
+                        task="transcribe",
+                    )
+                    result = processor.batch_decode(tokens, skip_special_tokens=True)[0]
 
-            tokens = model.generate(
-                input_features=input_features,
-                attention_mask=attention_mask,
-                language="ru",          # или "ru" для golos
-                task="transcribe",
-            )
-            result = processor.batch_decode(tokens, skip_special_tokens=True)[0]
+                    metrics = asr_metrics(result, text)
+                    wer_hist.append(metrics["wer"])
+                    cer_hist.append(metrics["cer"])
+                    generated_texts.append(result)
+                    original_texts.append(text)
 
-            metrics = asr_metrics(result, text)
-            wer_hist.append(metrics["wer"])
-            cer_hist.append(metrics["cer"])
-            generated_texts.append(result)
-            original_texts.append(text)
-
-        print(encoder_timer.times)
-        print(decoder_timer.times)
-        
         return BenchmarkResult(
             wer_history=wer_hist,
             cer_history=cer_hist,
             generated_texts=generated_texts,
             original_texts=original_texts,
+            encoder_speed=encoder_timer.times,
+            decoder_speed=decoder_timer.times,
+            profiler=prof.key_averages().table(
+                sort_by=("self_cpu_time_total" if self.device == "cpu" else "self_cuda_time_total"),
+                row_limit=10,
+            ),
         )
 
     def get_models(self):
         return self.models
 
-    def sample(data):
-        pass
-
 
 if __name__ == "__main__":
-    results = Benchmark(
+    results_base = Benchmark(
         dataset_name="golos",
         models={},
         device="CPU",
-    ).run("BaseWhisper", sample_size=5)
-    plot_benchmarks(results)
+    ).run("BaseWhisper", sample_size=20)
+    results_large = Benchmark(
+        dataset_name="golos",
+        models={},
+        device="CPU",
+    ).run("LargeWhisper", sample_size=20)
+    results = {"BaseWhisper": results_base, "LargeWhisper": results_large}
+    plot_benchmarks(results, "./plots.png")
+    plot_profiler_averages(results, "./profiler_plot.png")
