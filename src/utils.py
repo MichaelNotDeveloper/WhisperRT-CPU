@@ -72,6 +72,7 @@ class BenchmarkResult:
     cer_history: list[float]
     generated_texts: list[str]
     original_texts: list[str]
+    audio_time_ratio: list[float]
     encoder_speed: list[float]
     decoder_speed: list[float]
     processor_speed: list[float] = field(default_factory=list)
@@ -166,7 +167,7 @@ def plot_benchmarks(
         raise ValueError("results is empty")
 
     with plt.style.context("seaborn-v0_8-whitegrid"):
-        fig, axes = plt.subplots(2, 3, figsize=(18, 10), constrained_layout=True)
+        fig, axes = plt.subplots(2, 3, figsize=(18, 11), constrained_layout=True)
         fig.suptitle("Benchmark Comparison", fontsize=16, fontweight="bold")
 
         _plot_metric(
@@ -186,6 +187,14 @@ def plot_benchmarks(
             "Character Error Rate",
             "#F58518",
             lower_is_better=False,
+        )
+        _plot_metric(
+            axes[0, 2],
+            results,
+            "audio_time_ratio",
+            "Runtime / Audio Duration (RTF)",
+            "Ratio",
+            "#B279A2",
         )
         _plot_metric(
             axes[1, 0],
@@ -212,7 +221,6 @@ def plot_benchmarks(
             "Seconds per processor call",
             "#72B7B2",
         )
-        axes[0, 2].axis("off")
 
         summary_lines = []
         for name, result in results.items():
@@ -222,22 +230,14 @@ def plot_benchmarks(
                 f"{name}: samples={len(result.wer_history)}, "
                 f"avg generated chars={gen_mean:.1f}, avg reference chars={ref_mean:.1f}"
             )
-        axes[0, 2].set_title("Summary", fontsize=13, fontweight="semibold")
-        axes[0, 2].text(
-            0.02,
-            0.98,
-            "\n".join(summary_lines),
-            ha="left",
+        fig.text(
+            0.5,
+            0.965,
+            " | ".join(summary_lines),
+            ha="center",
             va="top",
             fontsize=9,
-            color="#444444",
-            transform=axes[0, 2].transAxes,
-            bbox={
-                "boxstyle": "round,pad=0.4",
-                "facecolor": "#f7f7f7",
-                "edgecolor": "#d0d0d0",
-                "alpha": 0.95,
-            },
+            color="#555555",
         )
 
         if save_path is not None:

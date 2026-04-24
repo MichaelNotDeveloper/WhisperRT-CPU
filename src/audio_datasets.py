@@ -1,13 +1,19 @@
-from itertools import islice
 import io
+from itertools import islice
+
 import numpy as np
 import soundfile as sf
-from datasets import load_dataset, Audio
+import torch
+import torchaudio
+from datasets import Audio, load_dataset
 
 TEXT_COLUMNS = ("text", "sentence", "transcription", "transcript", "normalized_text")
+TARGET_SAMPLE_RATE = 16000
 PRESETS = {
     "librispeech": ("librispeech_asr", "clean", "test"),
     "golos": ("bond005/sberdevices_golos_10h_crowd", None, "validation"),
+    "earnings22": ("distil-whisper/earnings22", "chunked", "test"),
+    "earnings-22": ("distil-whisper/earnings22", "chunked", "test"),
 }
 
 
@@ -34,7 +40,15 @@ class AudioTextDataset:
         )
         if x.ndim == 2:
             x = x.mean(axis=1)
-        return {"array": np.asarray(x, dtype=np.float32), "sampling_rate": int(sr)}
+        x = np.asarray(x, dtype=np.float32)
+        if int(sr) != TARGET_SAMPLE_RATE:
+            x = torchaudio.functional.resample(
+                torch.from_numpy(x),
+                int(sr),
+                TARGET_SAMPLE_RATE,
+            ).numpy()
+            sr = TARGET_SAMPLE_RATE
+        return {"array": x, "sampling_rate": int(sr)}
 
     def _text(self, row):
         for c in TEXT_COLUMNS:
