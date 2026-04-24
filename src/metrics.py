@@ -1,3 +1,4 @@
+import time
 from dataclasses import dataclass, fields
 from typing import Any, Literal
 
@@ -73,6 +74,7 @@ class Benchmark:
         decoder_timer = ModuleTimer()
         encoder_timer.wrap(model.model.encoder)
         decoder_timer.wrap(model.model.decoder)
+        processor_speed = []
         with profile(activities=self.profiler_activities, record_shapes=True) as prof:
             with record_function("model_inference"):
                 for audio, text in tqdm(
@@ -80,12 +82,14 @@ class Benchmark:
                     total=sample_size,
                     desc=f"Benchmarking {model_name}",
                 ):
+                    processor_start = time.perf_counter()
                     inputs = processor(
                         audio["array"],
                         sampling_rate=audio["sampling_rate"],
                         return_tensors="pt",
                         return_attention_mask=True,
                     )
+                    processor_speed.append(time.perf_counter() - processor_start)
 
                     input_features = inputs.input_features.to(self.device)
                     attention_mask = inputs.attention_mask.to(self.device)
@@ -111,6 +115,7 @@ class Benchmark:
             original_texts=original_texts,
             encoder_speed=encoder_timer.times,
             decoder_speed=decoder_timer.times,
+            processor_speed=processor_speed,
             profiler=prof.key_averages().table(
                 sort_by=("self_cpu_time_total" if self.device == "cpu" else "self_cuda_time_total"),
                 row_limit=10,

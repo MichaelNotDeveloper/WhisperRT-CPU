@@ -2,7 +2,7 @@ import gc
 import math
 import re
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
 from typing import Any
@@ -74,6 +74,7 @@ class BenchmarkResult:
     original_texts: list[str]
     encoder_speed: list[float]
     decoder_speed: list[float]
+    processor_speed: list[float] = field(default_factory=list)
     profiler: Any = None
 
 
@@ -132,22 +133,20 @@ def _plot_metric(ax, results, attr, title, ylabel, color, *, show_ci=False, lowe
         color="#5a5a5a",
     )
 
-    max_value = max((abs(value) for value in means if np.isfinite(value)), default=1.0)
-    label_y_offset = max(max_value * 0.03, 0.01)
-    for bar, mean, ci, count in zip(bars, means, cis, counts, strict=False):
+    finite_tops = [mean + ci for mean, ci in zip(means, cis, strict=False) if np.isfinite(mean)]
+    max_top = max(finite_tops, default=1.0)
+    ax.set_ylim(0, max(max_top * 1.3, 0.1))
+
+    labels = []
+    for mean, ci, count in zip(means, cis, counts, strict=False):
         if not np.isfinite(mean):
+            labels.append("")
             continue
         label = f"{mean:.4f}\nn={count}"
         if show_ci:
             label += f"\n±{ci:.4f}"
-        ax.text(
-            bar.get_x() + bar.get_width() / 2,
-            bar.get_height() + label_y_offset,
-            label,
-            ha="center",
-            va="bottom",
-            fontsize=9,
-        )
+        labels.append(label)
+    ax.bar_label(bars, labels=labels, padding=4, fontsize=9)
 
 
 def plot_benchmarks(
@@ -167,7 +166,7 @@ def plot_benchmarks(
         raise ValueError("results is empty")
 
     with plt.style.context("seaborn-v0_8-whitegrid"):
-        fig, axes = plt.subplots(2, 2, figsize=(16, 10), constrained_layout=True)
+        fig, axes = plt.subplots(2, 3, figsize=(18, 10), constrained_layout=True)
         fig.suptitle("Benchmark Comparison", fontsize=16, fontweight="bold")
 
         _plot_metric(
@@ -205,6 +204,15 @@ def plot_benchmarks(
             "#E45756",
             show_ci=True,
         )
+        _plot_metric(
+            axes[1, 2],
+            results,
+            "processor_speed",
+            "Processor Speed",
+            "Seconds per processor call",
+            "#72B7B2",
+        )
+        axes[0, 2].axis("off")
 
         summary_lines = []
         for name, result in results.items():
@@ -214,14 +222,22 @@ def plot_benchmarks(
                 f"{name}: samples={len(result.wer_history)}, "
                 f"avg generated chars={gen_mean:.1f}, avg reference chars={ref_mean:.1f}"
             )
-        fig.text(
-            0.5,
-            0.005,
+        axes[0, 2].set_title("Summary", fontsize=13, fontweight="semibold")
+        axes[0, 2].text(
+            0.02,
+            0.98,
             "\n".join(summary_lines),
-            ha="center",
-            va="bottom",
+            ha="left",
+            va="top",
             fontsize=9,
             color="#444444",
+            transform=axes[0, 2].transAxes,
+            bbox={
+                "boxstyle": "round,pad=0.4",
+                "facecolor": "#f7f7f7",
+                "edgecolor": "#d0d0d0",
+                "alpha": 0.95,
+            },
         )
 
         if save_path is not None:
