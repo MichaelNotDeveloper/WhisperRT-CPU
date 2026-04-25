@@ -357,6 +357,8 @@ def build_models(args, device: torch.device, amp_dtype: torch.dtype):
     dtype = amp_dtype if device.type == "cuda" else torch.float32
     teacher.to(device=device, dtype=dtype)
     student.to(device=device)
+    student.model.decoder.to(dtype=torch.float32)
+    student.proj_out.to(dtype=torch.float32)
     if device.type == "cuda" and amp_dtype == torch.float16:
         student.model.encoder.to(dtype=torch.float16)
 
@@ -483,8 +485,9 @@ def make_scheduler(optimizer, total_steps: int, warmup_ratio: float):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
-def build_grad_scaler(device: torch.device, amp_dtype: torch.dtype):
+def build_grad_scaler(device: torch.device, amp_dtype: torch.dtype, params):
     enabled = device.type == "cuda" and amp_dtype == torch.float16
+    enabled = enabled and all(param.dtype == torch.float32 for param in params if param.requires_grad)
     if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
         return torch.amp.GradScaler("cuda", enabled=enabled)
     return torch.cuda.amp.GradScaler(enabled=enabled)
@@ -498,7 +501,7 @@ def train(teacher, student, processor, train_loader, eval_loader, args, out_dir:
 
     optimizer = AdamW(params, lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.98))
     scheduler = make_scheduler(optimizer, total_steps, args.warmup_ratio)
-    scaler = build_grad_scaler(device, amp_dtype)
+    scaler = build_grad_scaler(device, amp_dtype, params)
 
     history = {
         "step": [],
