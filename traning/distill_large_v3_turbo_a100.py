@@ -178,50 +178,46 @@ def maybe_take(ds, n: int | None, seed: int, shuffle: bool):
         return ds
     return ds.select(range(min(n, len(ds))))
 
-
 def load_train_dataset(args):
-    parts, sources = [], []
+    files = [
+        "hf://datasets/librispeech_asr/clean/train.100/0000.parquet",
+    ]
 
-    for name in args.train_presets:
-        split = OFFICIAL[name]["train"]
-        if split is None:
-            continue
+    ds = load_dataset(
+        "parquet",
+        data_files=files,
+        split="train",
+        streaming=True,
+    )
 
-        try:
-            ds = load_split(name, split, args.cache_dir, streaming=args.streaming)
+    ds = ds.cast_column("audio", Audio(sampling_rate=SAMPLE_RATE))
 
-            if args.streaming:
-                ds = ds.shuffle(seed=args.seed, buffer_size=args.shuffle_buffer)
-                if args.max_train_samples is not None:
-                    ds = ds.take(args.max_train_samples)
-            else:
-                ds = maybe_take(ds, args.max_train_samples, args.seed, True)
+    if args.max_train_samples is not None:
+        ds = ds.shuffle(seed=args.seed, buffer_size=args.shuffle_buffer)
+        ds = ds.take(args.max_train_samples)
 
-            parts.append(ds)
-            sources.append(f"{name}: {OFFICIAL[name]['path']}/{OFFICIAL[name]['config'] or '-'} ({split})")
-        except Exception as exc:
-            print(f"[dataset skip] {name}: {exc}")
-
-    if not parts:
-        raise RuntimeError("No train datasets loaded.")
-
-    if args.streaming:
-        if len(parts) > 1:
-            raise RuntimeError("For streaming mode, start with one --train-presets dataset.")
-        if args.max_train_samples is None:
-            raise RuntimeError("For streaming mode, pass --max-train-samples.")
-        return parts[0], sources
-
-    ds = parts[0] if len(parts) == 1 else concatenate_datasets(parts)
+    sources = ["librispeech_asr clean/train.100/0000.parquet only"]
     return ds, sources
 
 
 def load_eval_dataset(name: str, limit: int | None, args):
-    split = OFFICIAL[name]["eval"]
-    if split is None:
-        raise RuntimeError(f"{name} has no eval split")
-    ds = load_split(name, split, args.cache_dir, streaming=False)
-    return maybe_take(ds, limit, args.seed, False)
+    files = [
+        "hf://datasets/librispeech_asr/clean/test.clean/0000.parquet",
+    ]
+
+    ds = load_dataset(
+        "parquet",
+        data_files=files,
+        split="train",
+        streaming=True,
+    )
+
+    ds = ds.cast_column("audio", Audio(sampling_rate=SAMPLE_RATE))
+
+    if limit is not None:
+        ds = ds.take(limit)
+
+    return ds
 
 
 class BatchCollator:
