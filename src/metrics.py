@@ -2,6 +2,7 @@ import time
 from dataclasses import dataclass, fields
 from typing import Any, Literal
 
+from contextlib import nullcontext
 import torch
 import torch.nn as nn
 from torch.profiler import ProfilerActivity, profile, record_function
@@ -38,6 +39,7 @@ class Benchmark:
         dataset_name: str,
         models: dict[str, nn.Module],
         device: Literal["CPU", "GPU"],
+        profiler: bool = True
     ):
         self.models = models
         self.processors = {}
@@ -49,6 +51,9 @@ class Benchmark:
             if device == "CPU"
             else [ProfilerActivity.CUDA, ProfilerActivity.CPU]
         )
+        self.profiler_state = profiler
+        self.profiler = profile(activities=self.profiler_activities, record_shapes=True) if profiler else nullcontext()
+        self.record_func = record_function("model_inference") if profiler else nullcontext() 
 
         for field in fields(ModelsForBenchmark):
             self.models[field.name] = getattr(ModelsForBenchmark, field.name)
@@ -112,8 +117,8 @@ class Benchmark:
         encoder_timer.wrap(model.model.encoder)
         decoder_timer.wrap(model.model.decoder)
         processor_speed = []
-        with profile(activities=self.profiler_activities, record_shapes=True) as prof:
-            with record_function("model_inference"):
+        with self.profiler as prof:
+            with self.record_func:
                 for audio, text in tqdm(
                     self.dataset.take(sample_size),
                     total=sample_size,
@@ -139,15 +144,14 @@ class Benchmark:
                         task="transcribe",
                     )
                     result = processor.batch_decode(tokens, skip_special_tokens=True)[0]
-
-                    metrics = asr_metrics(result, text)
-                    wer_hist.append(metrics["wer"])
-                    cer_hist.append(metrics["cer"])
-                    generated_texts.append(result)
-                    original_texts.append(text)
                     sample_runtime = time.perf_counter() - sample_start
                     audio_duration = len(audio["array"]) / audio["sampling_rate"]
                     audio_time_ratio.append(sample_runtime / audio_duration)
+            metrics = asr_metrics(result, text)
+            wer_hist.append(metrics["wer"])
+            cer_hist.append(metrics["cer"])
+            generated_texts.append(result)
+            original_texts.append(text)
 
         return BenchmarkResult(
             wer_history=wer_hist,
@@ -161,7 +165,7 @@ class Benchmark:
             profiler=prof.key_averages().table(
                 sort_by=("self_cpu_time_total" if self.device == "cpu" else "self_cuda_time_total"),
                 row_limit=10,
-            ),
+            ) if self.profiler_state else None,
         )
 
     def get_models(self):
@@ -169,16 +173,14 @@ class Benchmark:
 
 
 if __name__ == "__main__":
-    results_large = Benchmark(
+    bench = Benchmark(
         dataset_name="earnings22",
         models={},
         device="CPU",
-    ).run("CompileWhipser", sample_size=20)
-    results_base = Benchmark(
-        dataset_name="earnings22",
-        models={},
-        device="CPU",
-    ).run("TurboWhisper", sample_size=20)
+        profiler=False
+    )
+    results_large = bench.run("CompileWhipser", sample_size=20)
+    results_base = bench.run("TurboWhisper", sample_size=20)
     results = {"TurboWhisper": results_base, "CompileWhipser": results_large}
     plot_benchmarks(results, "./plots.png")
     plot_profiler_averages(results, "./profiler_plot.png")

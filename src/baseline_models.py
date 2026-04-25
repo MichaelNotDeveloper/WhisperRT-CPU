@@ -38,12 +38,14 @@ class TorchCompileTurboParams:
         dtype: torch.dtype = torch.float32,
         compile_mode: str = "reduce-overhead",
         fullgraph: bool = False,
-        dynamic: bool = True,
+        dynamic: bool = False,
     ):
         self.model = WhisperForConditionalGeneration.from_pretrained(
             model_name,
             torch_dtype=dtype,
         )
+
+        torch._logging.set_logs(graph_code=True)
 
         self.model.model.encoder = torch.compile(
             self.model.model.encoder,

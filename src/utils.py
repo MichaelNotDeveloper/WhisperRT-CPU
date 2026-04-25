@@ -292,13 +292,13 @@ def _parse_profiler_table(table: str) -> tuple[str, list[tuple[str, float]]]:
 
 
 def plot_profiler_averages(
-    results: dict[str, BenchmarkResult],
+    results: dict[str, BenchmarkResult] | None,
     save_path: str | Path | None = None,
-) -> tuple[plt.Figure, plt.Axes]:
+) -> tuple[plt.Figure | None, plt.Axes | None]:
     """Строит отдельный grouped barplot по среднему времени операций из torch.profiler."""
 
     if not results:
-        raise ValueError("results is empty")
+        return None, None
 
     parsed_results: dict[str, dict[str, float]] = {}
     avg_column_name = None
@@ -313,7 +313,7 @@ def plot_profiler_averages(
                 op_names.append(name)
 
     if not parsed_results or not op_names:
-        raise ValueError("Profiler data is empty or could not be parsed")
+        return None, None
 
     with plt.style.context("seaborn-v0_8-whitegrid"):
         fig_height = max(6, 0.5 * len(op_names) + 2)
