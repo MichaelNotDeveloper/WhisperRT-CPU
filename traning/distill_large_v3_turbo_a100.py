@@ -21,7 +21,6 @@ import torch.nn as nn
 import torch.nn.functional as F
 from datasets import Audio, load_dataset
 from jiwer import cer, wer
-from torch.cuda.amp import GradScaler
 from torch.optim import AdamW
 from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
@@ -79,6 +78,7 @@ def parse_args():
     p.add_argument("--cache-dir", default=None)
 
     p.add_argument("--gradient-checkpointing", action="store_true")
+    p.add_argument("--cpu-fallback", action="store_true")
     p.add_argument("--skip-final-teacher-eval", action="store_true")
 
     return p.parse_args()
@@ -102,6 +102,21 @@ def get_dtype(name: str):
     return {"fp16": torch.float16, "fp32": torch.float32}[name]
 
 
+def parse_supported_sms():
+    sms = set()
+    for arch in getattr(torch.cuda, "get_arch_list", lambda: [])():
+        if not arch.startswith("sm_"):
+            continue
+        suffix = arch.split("_", 1)[1]
+        if suffix.isdigit() and len(suffix) >= 2:
+            sms.add((int(suffix[:-1]), int(suffix[-1])))
+    return sms
+
+
+def format_sms(sms):
+    return ", ".join(f"sm_{major}{minor}" for major, minor in sorted(sms))
+
+
 def resolve_runtime(args):
     device = torch.device(args.device)
 
@@ -112,6 +127,23 @@ def resolve_runtime(args):
         gpu = torch.cuda.get_device_name(0)
         cc = torch.cuda.get_device_capability(0)
         print(f"[runtime] GPU={gpu}, capability={cc[0]}.{cc[1]}")
+
+        supported_sms = parse_supported_sms()
+        if supported_sms and cc not in supported_sms:
+            message = (
+                f"Current PyTorch build does not include kernels for sm_{cc[0]}{cc[1]} ({gpu}). "
+                f"Supported GPU architectures in this build: {format_sms(supported_sms)}. "
+                "On Kaggle this means the current runtime cannot train on P100 with this PyTorch build. "
+                "Switch the accelerator to T4/L4, install a PyTorch build with sm_60 support, "
+                "or rerun with --cpu-fallback."
+            )
+            if args.cpu_fallback:
+                print(f"[runtime] {message}")
+                print("[runtime] switching to CPU fallback")
+                args.device = "cpu"
+                args.dtype = "fp32"
+                return torch.device("cpu"), torch.float32
+            raise RuntimeError(message)
 
         if cc[0] < 8 and args.dtype != "fp16":
             print("[runtime] pre-Ampere GPU detected, switching dtype to fp16")
@@ -180,6 +212,7 @@ class BatchCollator:
         self.processor = processor
         self.max_label_tokens = max_label_tokens
         self.bos = processor.tokenizer.bos_token_id
+        self.max_audio_samples = processor.feature_extractor.n_samples
 
     def __call__(self, items):
         audios = [x["audio"]["array"] for x in items]
@@ -188,7 +221,9 @@ class BatchCollator:
         features = self.processor.feature_extractor(
             audios,
             sampling_rate=SAMPLE_RATE,
-            padding="longest",
+            padding="max_length",
+            max_length=self.max_audio_samples,
+            truncation=True,
             return_attention_mask=True,
             return_tensors="pt",
         )
@@ -388,6 +423,13 @@ def make_scheduler(optimizer, total_steps: int, warmup_ratio: float):
     return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
 
 
+def build_grad_scaler(device: torch.device, amp_dtype: torch.dtype):
+    enabled = device.type == "cuda" and amp_dtype == torch.float16
+    if hasattr(torch, "amp") and hasattr(torch.amp, "GradScaler"):
+        return torch.amp.GradScaler("cuda", enabled=enabled)
+    return torch.cuda.amp.GradScaler(enabled=enabled)
+
+
 def train(teacher, student, processor, train_loader, eval_loader, args, out_dir: Path, device, amp_dtype):
     params = [p for p in student.parameters() if p.requires_grad]
 
@@ -396,7 +438,7 @@ def train(teacher, student, processor, train_loader, eval_loader, args, out_dir:
 
     optimizer = AdamW(params, lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.98))
     scheduler = make_scheduler(optimizer, total_steps, args.warmup_ratio)
-    scaler = GradScaler(enabled=device.type == "cuda" and amp_dtype == torch.float16)
+    scaler = build_grad_scaler(device, amp_dtype)
 
     history = {
         "step": [],
