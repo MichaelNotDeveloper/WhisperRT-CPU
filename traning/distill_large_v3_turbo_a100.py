@@ -97,6 +97,8 @@ def parse_args():
     p.add_argument("--save-every", type=int, default=0)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--cache-dir", default=None)
+    p.add_argument("--streaming", action="store_true")
+    p.add_argument("--shuffle-buffer", type=int, default=1000)
     p.add_argument("--gradient-checkpointing", action="store_true")
     p.add_argument("--skip-final-teacher-eval", action="store_true")
     return p.parse_args()
@@ -145,22 +147,27 @@ def normalize(text: str):
     return " ".join(str(text).strip().lower().split())
 
 
-def load_split(name: str, split: str, cache_dir: str | None):
+def load_split(name: str, split: str, cache_dir: str | None, streaming: bool = False):
     spec = OFFICIAL[name]
-    kwargs = {"split": split}
+    kwargs = {"split": split, "streaming": streaming}
     if cache_dir:
         kwargs["cache_dir"] = cache_dir
+
     if spec["config"]:
         ds = load_dataset(spec["path"], spec["config"], **kwargs)
     else:
         ds = load_dataset(spec["path"], **kwargs)
+
     ds = ds.cast_column("audio", Audio(sampling_rate=SAMPLE_RATE))
+
     if spec["text"] != "text":
         ds = ds.rename_column(spec["text"], "text")
+
     keep = {"audio", "text"}
     drop = [c for c in ds.column_names if c not in keep]
     if drop:
         ds = ds.remove_columns(drop)
+
     return ds
 
 
@@ -174,29 +181,46 @@ def maybe_take(ds, n: int | None, seed: int, shuffle: bool):
 
 def load_train_dataset(args):
     parts, sources = [], []
+
     for name in args.train_presets:
         split = OFFICIAL[name]["train"]
         if split is None:
             continue
+
         try:
-            ds = load_split(name, split, args.cache_dir)
-            if args.max_train_samples is not None:
-                split = f"{split}[:{args.max_train_samples}]"
-            parts.append(load_split(name, split, args.cache_dir))
+            ds = load_split(name, split, args.cache_dir, streaming=args.streaming)
+
+            if args.streaming:
+                ds = ds.shuffle(seed=args.seed, buffer_size=args.shuffle_buffer)
+                if args.max_train_samples is not None:
+                    ds = ds.take(args.max_train_samples)
+            else:
+                ds = maybe_take(ds, args.max_train_samples, args.seed, True)
+
+            parts.append(ds)
             sources.append(f"{name}: {OFFICIAL[name]['path']}/{OFFICIAL[name]['config'] or '-'} ({split})")
         except Exception as exc:
             print(f"[dataset skip] {name}: {exc}")
+
     if not parts:
         raise RuntimeError("No train datasets loaded.")
+
+    if args.streaming:
+        if len(parts) > 1:
+            raise RuntimeError("For streaming mode, start with one --train-presets dataset.")
+        if args.max_train_samples is None:
+            raise RuntimeError("For streaming mode, pass --max-train-samples.")
+        return parts[0], sources
+
     ds = parts[0] if len(parts) == 1 else concatenate_datasets(parts)
-    return maybe_take(ds, args.max_train_samples, args.seed, True), sources
+    return ds, sources
 
 
 def load_eval_dataset(name: str, limit: int | None, args):
     split = OFFICIAL[name]["eval"]
     if split is None:
         raise RuntimeError(f"{name} has no eval split")
-    ds = load_split(name, split, args.cache_dir)
+    ds = load_split(name, split, args.cache_dir, streaming=False)
     return maybe_take(ds, limit, args.seed, False)
 
 
@@ -390,7 +414,11 @@ def make_scheduler(optimizer, total_steps: int, warmup_ratio: float):
 
 def train(teacher, student, processor, train_loader, eval_loader, args, out_dir: Path, device, amp_dtype):
     params = [p for p in student.parameters() if p.requires_grad]
-    total_steps = max(1, math.ceil(len(train_loader) / args.grad_accum) * args.epochs)
+    if args.streaming:
+        batches_per_epoch = math.ceil(args.max_train_samples / args.train_batch_size)
+        total_steps = max(1, math.ceil(batches_per_epoch / args.grad_accum) * args.epochs)
+    else:
+        total_steps = max(1, math.ceil(len(train_loader) / args.grad_accum) * args.epochs)
     optimizer = AdamW(params, lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.98))
     scheduler = make_scheduler(optimizer, total_steps, args.warmup_ratio)
     scaler = GradScaler(enabled=device.type == "cuda" and amp_dtype == torch.float16)
@@ -414,6 +442,11 @@ def train(teacher, student, processor, train_loader, eval_loader, args, out_dir:
     for epoch in range(args.epochs):
         student.train()
         for micro_step, batch in enumerate(train_loader, start=1):
+            if args.streaming:
+                max_micro_steps = math.ceil(args.max_train_samples / args.train_batch_size)
+                if micro_step > max_micro_steps:
+                    break
+
             start = time.perf_counter()
             x, m, y = move_batch(batch, device)
             dec = shift_tokens_right(y, student.config.pad_token_id, student.config.decoder_start_token_id)
@@ -453,7 +486,9 @@ def train(teacher, student, processor, train_loader, eval_loader, args, out_dir:
             else:
                 scaled.backward()
 
-            is_update_step = micro_step % args.grad_accum == 0 or micro_step == len(train_loader)
+            is_last_streaming_step = args.streaming and micro_step == math.ceil(args.max_train_samples / args.train_batch_size)
+            is_last_regular_step = (not args.streaming) and micro_step == len(train_loader)
+            is_update_step = micro_step % args.grad_accum == 0 or is_last_streaming_step or is_last_regular_step
             if not is_update_step:
                 continue
 
