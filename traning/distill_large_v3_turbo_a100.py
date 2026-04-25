@@ -4,13 +4,10 @@ import argparse
 import copy
 import json
 import math
-import os
 import random
 import time
 from contextlib import nullcontext
 from pathlib import Path
-
-os.environ.pop("MPLBACKEND", None)
 
 import matplotlib
 
@@ -22,17 +19,19 @@ import torch.nn.functional as F
 from datasets import Audio, load_dataset
 from jiwer import cer, wer
 from torch.optim import AdamW
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, IterableDataset
 from tqdm.auto import tqdm
 from transformers import WhisperForConditionalGeneration, WhisperProcessor
 from transformers.models.whisper.modeling_whisper import shift_tokens_right
 
 SAMPLE_RATE = 16_000
 
-# Direct parquet shard. This avoids the Hugging Face librispeech_asr builder,
-# which may resolve/download many shards even when only a small slice is requested.
-LIBRISPEECH_SMALL_FILES = [
-    "hf://datasets/librispeech_asr/clean/train.100/0000.parquet",
+TRAIN100_FILES = [
+    f"hf://datasets/openslr/librispeech_asr/clean/train.100/{i:04d}.parquet"
+    for i in range(14)
+]
+TEST_CLEAN_FILES = [
+    "hf://datasets/openslr/librispeech_asr/clean/test/0000.parquet",
 ]
 
 
@@ -87,12 +86,12 @@ def parse_args():
 def seed_everything(seed: int):
     random.seed(seed)
     torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
 
     if hasattr(torch, "set_float32_matmul_precision"):
         torch.set_float32_matmul_precision("high")
 
     if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
         torch.backends.cudnn.benchmark = True
@@ -185,26 +184,85 @@ def load_parquet_stream(files, cache_dir: str | None):
     return ds
 
 
+def shuffle_stream(rows, buffer_size: int, seed: int):
+    rng = random.Random(seed)
+    buffer = []
+
+    for row in rows:
+        if len(buffer) < buffer_size:
+            buffer.append(row)
+            continue
+
+        index = rng.randrange(len(buffer))
+        yield buffer[index]
+        buffer[index] = row
+
+    rng.shuffle(buffer)
+    for row in buffer:
+        yield row
+
+
+class StreamingAudioDataset(IterableDataset):
+    def __init__(
+        self,
+        files,
+        *,
+        start: int = 0,
+        limit: int | None = None,
+        shuffle_buffer: int = 0,
+        seed: int = 42,
+        cache_dir: str | None = None,
+    ):
+        self.files = files
+        self.start = start
+        self.limit = limit
+        self.shuffle_buffer = shuffle_buffer
+        self.seed = seed
+        self.cache_dir = cache_dir
+
+    def _rows(self):
+        for file in self.files:
+            ds = load_parquet_stream([file], self.cache_dir)
+            for row in ds:
+                yield row
+
+    def __iter__(self):
+        rows = self._rows()
+        if self.shuffle_buffer > 1:
+            rows = shuffle_stream(rows, self.shuffle_buffer, self.seed)
+
+        seen = 0
+        yielded = 0
+        for row in rows:
+            if seen < self.start:
+                seen += 1
+                continue
+            if self.limit is not None and yielded >= self.limit:
+                break
+            seen += 1
+            yielded += 1
+            yield row
+
+
 def load_train_dataset(args):
-    ds = load_parquet_stream(LIBRISPEECH_SMALL_FILES, args.cache_dir)
-
-    if args.shuffle_buffer > 0:
-        ds = ds.shuffle(seed=args.seed, buffer_size=args.shuffle_buffer)
-
-    ds = ds.take(args.max_train_samples)
-
-    sources = ["librispeech_asr clean/train.100/0000.parquet only"]
+    ds = StreamingAudioDataset(
+        TRAIN100_FILES,
+        limit=args.max_train_samples,
+        shuffle_buffer=args.shuffle_buffer,
+        seed=args.seed,
+        cache_dir=args.cache_dir,
+    )
+    sources = ["openslr/librispeech_asr clean/train.100 parquet shards streamed lazily"]
     return ds, sources
 
 
 def load_eval_dataset(limit: int, offset: int, args):
-    ds = load_parquet_stream(LIBRISPEECH_SMALL_FILES, args.cache_dir)
-
-    if offset > 0:
-        ds = ds.skip(offset)
-
-    ds = ds.take(limit)
-    return ds
+    return StreamingAudioDataset(
+        TEST_CLEAN_FILES,
+        start=offset,
+        limit=limit,
+        cache_dir=args.cache_dir,
+    )
 
 
 class BatchCollator:
@@ -298,7 +356,9 @@ def build_models(args, device: torch.device, amp_dtype: torch.dtype):
 
     dtype = amp_dtype if device.type == "cuda" else torch.float32
     teacher.to(device=device, dtype=dtype)
-    student.to(device=device, dtype=dtype)
+    student.to(device=device)
+    if device.type == "cuda" and amp_dtype == torch.float16:
+        student.model.encoder.to(dtype=torch.float16)
 
     return teacher, student
 
@@ -459,16 +519,24 @@ def train(teacher, student, processor, train_loader, eval_loader, args, out_dir:
     for epoch in range(args.epochs):
         student.train()
         max_micro_steps = math.ceil(args.max_train_samples / args.train_batch_size)
+        accum_start = None
+        accum_samples = 0
 
         for micro_step, batch in enumerate(train_loader, start=1):
             if micro_step > max_micro_steps:
                 break
 
-            start = time.perf_counter()
+            if accum_start is None:
+                accum_start = time.perf_counter()
 
             x, m, y = move_batch(batch, device)
+            accum_samples += x.size(0)
             dec = shift_tokens_right(y, student.config.pad_token_id, student.config.decoder_start_token_id)
             dec_mask = dec.ne(student.config.pad_token_id).long()
+
+            window_start = ((micro_step - 1) // args.grad_accum) * args.grad_accum + 1
+            window_end = min(window_start + args.grad_accum - 1, max_micro_steps)
+            microbatches_in_update = window_end - window_start + 1
 
             with autocast_ctx(device, amp_dtype):
                 with torch.no_grad():
@@ -498,14 +566,13 @@ def train(teacher, student, processor, train_loader, eval_loader, args, out_dir:
                 kl_loss = masked_kl(s_logits, t_logits, y, args.temperature)
                 loss = args.ce_weight * ce_loss + args.kl_weight * kl_loss
 
-            scaled = loss / args.grad_accum
+            scaled = loss / microbatches_in_update
             if scaler.is_enabled():
                 scaler.scale(scaled).backward()
             else:
                 scaled.backward()
 
-            is_last_step = micro_step == max_micro_steps
-            is_update_step = micro_step % args.grad_accum == 0 or is_last_step
+            is_update_step = micro_step == window_end
             if not is_update_step:
                 continue
 
@@ -525,13 +592,15 @@ def train(teacher, student, processor, train_loader, eval_loader, args, out_dir:
             global_step += 1
             pbar.update(1)
 
-            elapsed = time.perf_counter() - start
+            elapsed = time.perf_counter() - accum_start
             history["step"].append(global_step)
             history["loss"].append(float(loss.item()))
             history["ce"].append(float(ce_loss.item()))
             history["kl"].append(float(kl_loss.item()))
             history["lr"].append(float(scheduler.get_last_lr()[0]))
-            history["samples_sec"].append((x.size(0) * args.grad_accum) / max(elapsed, 1e-8))
+            history["samples_sec"].append(accum_samples / max(elapsed, 1e-8))
+            accum_start = None
+            accum_samples = 0
 
             if global_step % args.eval_every == 0:
                 metrics = evaluate(student, processor, eval_loader, args, device, amp_dtype, f"eval@{global_step}")
@@ -571,9 +640,9 @@ def main():
     device, amp_dtype = resolve_runtime(args)
 
     if args.eval_offset is None:
-        args.eval_offset = args.max_train_samples
+        args.eval_offset = 0
     if args.latency_offset is None:
-        args.latency_offset = args.max_train_samples + args.max_eval_samples
+        args.latency_offset = args.max_eval_samples
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
