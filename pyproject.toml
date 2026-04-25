@@ -5,18 +5,18 @@ description = "Whisper inference optimization on CPU"
 readme = "README.md"
 requires-python = ">=3.11,<3.13"
 dependencies = [
-    "torch==2.5.1",
-    "torchaudio==2.5.1",
-    "openai-whisper",
-    "numpy",
-    "soundfile",
-    "tqdm",
-    "jiwer",
-    "datasets",
-    "transformers",
-    "torchcodec",
-    "matplotlib",
-    "torchvision==0.20.1"
+    "torch==2.10.0",
+    "torchaudio==2.10.0",
+    "torchvision==0.25.0",
+    "torchcodec==0.10.0",
+    "transformers==5.0.0",
+    "datasets==4.8.3",
+    "numpy==2.4.3",
+    "tqdm==4.67.3",
+    "openai-whisper==20250625",
+    "jiwer==4.0.0",
+    "soundfile==0.13.1",
+    "matplotlib==3.10.8",
 ]
 
 [dependency-groups]
@@ -49,11 +49,11 @@ project-includes = ["src", "tests"]
 python-version = "3.11"
 
 [tool.uv.sources]
-torch = [{ index = "pytorch-cu121", marker = "sys_platform == 'linux'" }]
-torchaudio = [{ index = "pytorch-cu121", marker = "sys_platform == 'linux'" }]
-torchvision = [{ index = "pytorch-cu121", marker = "sys_platform == 'linux'" }]
+torch = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
+torchaudio = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
+torchvision = [{ index = "pytorch-cu128", marker = "sys_platform == 'linux'" }]
 
 [[tool.uv.index]]
-name = "pytorch-cu121"
-url = "https://download.pytorch.org/whl/cu121"
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
 explicit = true
