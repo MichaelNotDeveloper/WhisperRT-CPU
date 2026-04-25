@@ -336,6 +336,12 @@ def build_models(args, device: torch.device, amp_dtype: torch.dtype):
     student.model.decoder.layers = nn.ModuleList([copy.deepcopy(old_layers[i]) for i in args.student_layers])
     student.config.decoder_layers = len(args.student_layers)
     student.model.decoder.config.decoder_layers = len(args.student_layers)
+    for new_idx, layer in enumerate(student.model.decoder.layers):
+        setattr(layer, "layer_idx", new_idx)
+        if hasattr(layer, "self_attn"):
+            setattr(layer.self_attn, "layer_idx", new_idx)
+        if hasattr(layer, "encoder_attn"):
+            setattr(layer.encoder_attn, "layer_idx", new_idx)
 
     teacher.config.use_cache = False
     student.config.use_cache = False
