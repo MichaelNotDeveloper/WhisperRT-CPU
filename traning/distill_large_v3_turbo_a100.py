@@ -6,6 +6,7 @@ import json
 import math
 import random
 import time
+import warnings
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -68,7 +69,7 @@ def parse_args():
     p.add_argument("--shuffle-buffer", type=int, default=256)
 
     p.add_argument("--max-label-tokens", type=int, default=128)
-    p.add_argument("--max-new-tokens", type=int, default=64)
+    p.add_argument("--max-new-tokens", type=int, default=192)
 
     p.add_argument("--eval-every", type=int, default=50)
     p.add_argument("--plot-every", type=int, default=25)
@@ -431,6 +432,9 @@ def move_batch(batch, device: torch.device):
 @torch.no_grad()
 def evaluate(model, processor, loader, args, device: torch.device, amp_dtype: torch.dtype, desc: str, warmup: int = 0):
     model.eval()
+    generation_config = copy.deepcopy(model.generation_config)
+    generation_config.max_length = None
+    generation_config.max_new_tokens = args.max_new_tokens
 
     preds, refs = [], []
     wall, seconds, samples = 0.0, 0.0, 0
@@ -443,15 +447,20 @@ def evaluate(model, processor, loader, args, device: torch.device, amp_dtype: to
         t0 = time.perf_counter()
 
         with autocast_ctx(device, amp_dtype):
-            ids = model.generate(
-                input_features=x,
-                attention_mask=m,
-                language=args.language,
-                task=args.task,
-                max_new_tokens=args.max_new_tokens,
-                num_beams=1,
-                do_sample=False,
-            )
+            with warnings.catch_warnings():
+                warnings.filterwarnings(
+                    "ignore",
+                    message=r"Both `max_new_tokens` .* `max_length`.*",
+                )
+                ids = model.generate(
+                    input_features=x,
+                    attention_mask=m,
+                    generation_config=generation_config,
+                    language=args.language,
+                    task=args.task,
+                    num_beams=1,
+                    do_sample=False,
+                )
 
         if device.type == "cuda":
             torch.cuda.synchronize()
