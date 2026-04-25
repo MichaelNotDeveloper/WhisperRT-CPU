@@ -10,7 +10,7 @@ from tqdm import tqdm
 from transformers import WhisperProcessor
 
 from audio_datasets import AudioTextDataset
-from baseline_models import BaselineTurbo, TorchCompileTurboParams
+from baseline_models import BaselineTurboParams, PrunedTurboDecoder, TorchCompileTurboParams, BaselineSmall
 from utils import (
     BenchmarkResult,
     ModuleTimer,
@@ -19,19 +19,24 @@ from utils import (
     plot_profiler_averages,
 )
 
+PRUNED_TURBO_CHECKPOINT = "2DecoderModelWeights"
+LOCAL_TURBO_PROCESSOR = PRUNED_TURBO_CHECKPOINT
+
 
 # Models are expected to expose `model.encoder` and `model.decoder`.
 @dataclass
 class ModelsForBenchmark:
-    TurboWhisper: nn.Module | None = BaselineTurbo()()
-    #LargeWhisper: nn.Module | None = BaselineLarge()()
+    BaseWhisper: nn.Module | None = BaselineSmall()()
+    TurboWhisper: nn.Module | None = BaselineTurboParams()()
     CompileWhipser: nn.Module | None = TorchCompileTurboParams()()
+    PrunedTurbo2Decoder: nn.Module | None = PrunedTurboDecoder(PRUNED_TURBO_CHECKPOINT)()
 
 @dataclass
 class ProcessingOptions:
-    TurboWhisper: Any = WhisperProcessor.from_pretrained("openai/whisper-large-v3-turbo")
-    #LargeWhisper: Any = WhisperProcessor.from_pretrained("openai/whisper-large-v3")
-    CompileWhipser: Any = WhisperProcessor.from_pretrained("openai/whisper-large-v3-turbo")
+    BaseWhisper: Any = WhisperProcessor.from_pretrained("openai/whisper-base")
+    TurboWhisper: Any = WhisperProcessor.from_pretrained(LOCAL_TURBO_PROCESSOR)
+    CompileWhipser: Any = WhisperProcessor.from_pretrained(LOCAL_TURBO_PROCESSOR)
+    PrunedTurbo2Decoder: Any = WhisperProcessor.from_pretrained(PRUNED_TURBO_CHECKPOINT)
 
 class Benchmark:
     def __init__(
@@ -100,7 +105,12 @@ class Benchmark:
 
         self._warmed_up.add(model_name)
 
-    def run(self, model_name: str, sample_size: int = 10) -> BenchmarkResult:
+    def run(
+        self,
+        model_name: str,
+        sample_size: int = 10,
+        print_predictions: bool = False,
+    ) -> BenchmarkResult:
         model = self.models[model_name]
         processor = self.processors[model_name]
 
@@ -114,44 +124,57 @@ class Benchmark:
 
         encoder_timer = ModuleTimer()
         decoder_timer = ModuleTimer()
-        encoder_timer.wrap(model.model.encoder)
-        decoder_timer.wrap(model.model.decoder)
+        original_encoder = encoder_timer.wrap(model.model.encoder)
+        original_decoder = decoder_timer.wrap(model.model.decoder)
         processor_speed = []
-        with self.profiler as prof:
-            with self.record_func:
-                for audio, text in tqdm(
-                    self.dataset.take(sample_size),
-                    total=sample_size,
-                    desc=f"Benchmarking {model_name}",
-                ):
-                    sample_start = time.perf_counter()
-                    processor_start = time.perf_counter()
-                    inputs = processor(
-                        audio["array"],
-                        sampling_rate=audio["sampling_rate"],
-                        return_tensors="pt",
-                        return_attention_mask=True,
-                    )
-                    processor_speed.append(time.perf_counter() - processor_start)
+        try:
+            with self.profiler as prof:
+                with self.record_func:
+                    with torch.inference_mode():
+                        for sample_index, (audio, text) in enumerate(
+                            tqdm(
+                                self.dataset.take(sample_size),
+                                total=sample_size,
+                                desc=f"Benchmarking {model_name}",
+                            ),
+                            start=1,
+                        ):
+                            sample_start = time.perf_counter()
+                            processor_start = time.perf_counter()
+                            inputs = processor(
+                                audio["array"],
+                                sampling_rate=audio["sampling_rate"],
+                                return_tensors="pt",
+                                return_attention_mask=True,
+                            )
+                            processor_speed.append(time.perf_counter() - processor_start)
 
-                    input_features = inputs.input_features.to(self.device)
-                    attention_mask = inputs.attention_mask.to(self.device)
+                            input_features = inputs.input_features.to(self.device)
+                            attention_mask = inputs.attention_mask.to(self.device)
 
-                    tokens = model.generate(
-                        input_features=input_features,
-                        attention_mask=attention_mask,
-                        language="ru",
-                        task="transcribe",
-                    )
-                    result = processor.batch_decode(tokens, skip_special_tokens=True)[0]
-                    sample_runtime = time.perf_counter() - sample_start
-                    audio_duration = len(audio["array"]) / audio["sampling_rate"]
-                    audio_time_ratio.append(sample_runtime / audio_duration)
-            metrics = asr_metrics(result, text)
-            wer_hist.append(metrics["wer"])
-            cer_hist.append(metrics["cer"])
-            generated_texts.append(result)
-            original_texts.append(text)
+                            tokens = model.generate(
+                                input_features=input_features,
+                                attention_mask=attention_mask,
+                                language="en",
+                                task="transcribe",
+                            )
+                            result = processor.batch_decode(tokens, skip_special_tokens=True)[0]
+                            sample_runtime = time.perf_counter() - sample_start
+                            audio_duration = len(audio["array"]) / audio["sampling_rate"]
+                            audio_time_ratio.append(sample_runtime / audio_duration)
+
+                            if print_predictions:
+                                tqdm.write(f"[{model_name} #{sample_index}] target: {text}")
+                                tqdm.write(f"[{model_name} #{sample_index}] prediction: {result}")
+
+                            metrics = asr_metrics(result, text)
+                            wer_hist.append(metrics["wer"])
+                            cer_hist.append(metrics["cer"])
+                            generated_texts.append(result)
+                            original_texts.append(text)
+        finally:
+            model.model.encoder.forward = original_encoder
+            model.model.decoder.forward = original_decoder
 
         return BenchmarkResult(
             wer_history=wer_hist,
@@ -179,8 +202,15 @@ if __name__ == "__main__":
         device="CPU",
         profiler=False
     )
-    results_large = bench.run("CompileWhipser", sample_size=20)
+    results_small = bench.run("BaseWhisper", sample_size=20)
     results_base = bench.run("TurboWhisper", sample_size=20)
-    results = {"TurboWhisper": results_base, "CompileWhipser": results_large}
+    results_large = bench.run("CompileWhipser", sample_size=20)
+    results_pruned = bench.run("PrunedTurbo2Decoder", sample_size=20, print_predictions=True)
+    results = {
+        "BaseWhisper": results_small,
+        "TurboWhisper": results_base,
+        "CompileWhipser": results_large,
+        "PrunedTurbo2Decoder": results_pruned,
+    }
     plot_benchmarks(results, "./plots.png")
     plot_profiler_averages(results, "./profiler_plot.png")

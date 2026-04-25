@@ -13,7 +13,6 @@ PRESETS = {
     "librispeech": ("librispeech_asr", "clean", "test"),
     "golos": ("bond005/sberdevices_golos_10h_crowd", None, "validation"),
     "earnings22": ("distil-whisper/earnings22", "chunked", "test"),
-    "earnings-22": ("distil-whisper/earnings22", "chunked", "test"),
 }
 
 

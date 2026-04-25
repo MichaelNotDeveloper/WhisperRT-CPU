@@ -2,6 +2,7 @@ import gc
 import math
 import re
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
@@ -11,7 +12,6 @@ import jiwer
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from jiwer import Compose, RemoveMultipleSpaces, Strip, ToLowerCase
 
 
 def clean_cache():
@@ -27,10 +27,28 @@ def seed_everything(seed: int):
     torch.backends.cudnn.benchmark = False
 
 
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def _normalize_asr_text(text: str) -> str:
+    text = unicodedata.normalize("NFKC", text).lower().replace("ё", "е")
+
+    normalized_chars = []
+    for char in text:
+        category = unicodedata.category(char)
+        if category == "Mn":
+            continue
+        if category.startswith(("P", "S")) or char == "_":
+            normalized_chars.append(" ")
+            continue
+        normalized_chars.append(char)
+
+    return _WHITESPACE_RE.sub(" ", "".join(normalized_chars)).strip()
+
+
 def asr_metrics(hypothesis: str, reference: str) -> dict[str, float]:
-    tr = Compose([ToLowerCase(), RemoveMultipleSpaces(), Strip()])
-    ref_tr = tr(reference)
-    hyp_tr = tr(hypothesis)
+    ref_tr = _normalize_asr_text(reference)
+    hyp_tr = _normalize_asr_text(hypothesis)
     out = jiwer.process_words(ref_tr, hyp_tr)
     wer = out.wer
     cer = jiwer.cer(ref_tr, hyp_tr)
@@ -177,7 +195,6 @@ def plot_benchmarks(
             "WER",
             "Word Error Rate",
             "#4C78A8",
-            lower_is_better=False,
         )
         _plot_metric(
             axes[0, 1],
@@ -186,7 +203,6 @@ def plot_benchmarks(
             "CER",
             "Character Error Rate",
             "#F58518",
-            lower_is_better=False,
         )
         _plot_metric(
             axes[0, 2],
