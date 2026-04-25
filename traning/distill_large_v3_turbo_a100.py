@@ -19,7 +19,7 @@ import matplotlib.pyplot as plt
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from datasets import Audio, concatenate_datasets, load_dataset
+from datasets import Audio, load_dataset
 from jiwer import cer, wer
 from torch.cuda.amp import GradScaler
 from torch.optim import AdamW
@@ -30,51 +30,25 @@ from transformers.models.whisper.modeling_whisper import shift_tokens_right
 
 SAMPLE_RATE = 16_000
 
-OFFICIAL = {
-    "official-librispeech-clean": {
-        "path": "librispeech_asr",
-        "config": "clean",
-        "train": "train.100",
-        "eval": "test.clean",
-        "text": "text",
-        "source": "https://huggingface.co/openai/whisper-large-v3-turbo/blob/main/README.md",
-    },
-    "official-common-voice-en": {
-        "path": "mozilla-foundation/common_voice_11_0",
-        "config": "en",
-        "train": "train+validation",
-        "eval": "test",
-        "text": "sentence",
-        "source": "https://huggingface.co/blog/fine-tune-whisper",
-    },
-    "official-librispeech-long": {
-        "path": "distil-whisper/librispeech_long",
-        "config": "clean",
-        "train": None,
-        "eval": "validation",
-        "text": "text",
-        "source": "https://huggingface.co/openai/whisper-large-v3-turbo/blob/main/README.md",
-    },
-}
+# Direct parquet shard. This avoids the Hugging Face librispeech_asr builder,
+# which may resolve/download many shards even when only a small slice is requested.
+LIBRISPEECH_SMALL_FILES = [
+    "hf://datasets/librispeech_asr/clean/train.100/0000.parquet",
+]
 
 
 def parse_args():
     p = argparse.ArgumentParser(formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+
     p.add_argument("--teacher-model", default="openai/whisper-large-v3-turbo")
     p.add_argument("--student-layers", type=int, nargs="+", default=[0, 3])
-    p.add_argument(
-        "--train-presets",
-        nargs="+",
-        default=["official-librispeech-clean"],
-        choices=sorted(OFFICIAL),
-    )
-    p.add_argument("--eval-preset", default="official-librispeech-clean", choices=sorted(OFFICIAL))
-    p.add_argument("--latency-preset", default="official-librispeech-long", choices=sorted(OFFICIAL))
-    p.add_argument("--output-dir", default="training/runs/distill_large_v3_turbo_p100")
+    p.add_argument("--output-dir", default="training/runs/distill_large_v3_turbo_p100_direct")
+
     p.add_argument("--device", default="cuda")
     p.add_argument("--dtype", choices=["fp16", "fp32"], default="fp16")
     p.add_argument("--language", default="english")
     p.add_argument("--task", default="transcribe")
+
     p.add_argument("--epochs", type=int, default=1)
     p.add_argument("--train-batch-size", type=int, default=1)
     p.add_argument("--eval-batch-size", type=int, default=1)
@@ -83,24 +57,30 @@ def parse_args():
     p.add_argument("--weight-decay", type=float, default=0.01)
     p.add_argument("--warmup-ratio", type=float, default=0.05)
     p.add_argument("--max-grad-norm", type=float, default=1.0)
+
     p.add_argument("--temperature", type=float, default=2.0)
     p.add_argument("--ce-weight", type=float, default=0.5)
     p.add_argument("--kl-weight", type=float, default=0.5)
-    p.add_argument("--num-workers", type=int, default=2)
-    p.add_argument("--max-train-samples", type=int, default=2000)
-    p.add_argument("--max-eval-samples", type=int, default=128)
-    p.add_argument("--max-latency-samples", type=int, default=32)
-    p.add_argument("--max-label-tokens", type=int, default=192)
-    p.add_argument("--max-new-tokens", type=int, default=96)
-    p.add_argument("--eval-every", type=int, default=200)
-    p.add_argument("--plot-every", type=int, default=50)
+
+    p.add_argument("--max-train-samples", type=int, default=500)
+    p.add_argument("--max-eval-samples", type=int, default=32)
+    p.add_argument("--max-latency-samples", type=int, default=8)
+    p.add_argument("--eval-offset", type=int, default=None)
+    p.add_argument("--latency-offset", type=int, default=None)
+    p.add_argument("--shuffle-buffer", type=int, default=256)
+
+    p.add_argument("--max-label-tokens", type=int, default=128)
+    p.add_argument("--max-new-tokens", type=int, default=64)
+
+    p.add_argument("--eval-every", type=int, default=50)
+    p.add_argument("--plot-every", type=int, default=25)
     p.add_argument("--save-every", type=int, default=0)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--cache-dir", default=None)
-    p.add_argument("--streaming", action="store_true")
-    p.add_argument("--shuffle-buffer", type=int, default=1000)
+
     p.add_argument("--gradient-checkpointing", action="store_true")
     p.add_argument("--skip-final-teacher-eval", action="store_true")
+
     return p.parse_args()
 
 
@@ -108,8 +88,10 @@ def seed_everything(seed: int):
     random.seed(seed)
     torch.manual_seed(seed)
     torch.cuda.manual_seed_all(seed)
+
     if hasattr(torch, "set_float32_matmul_precision"):
         torch.set_float32_matmul_precision("high")
+
     if torch.cuda.is_available():
         torch.backends.cuda.matmul.allow_tf32 = False
         torch.backends.cudnn.allow_tf32 = False
@@ -122,18 +104,22 @@ def get_dtype(name: str):
 
 def resolve_runtime(args):
     device = torch.device(args.device)
+
     if args.device.startswith("cuda") and not torch.cuda.is_available():
         raise RuntimeError("CUDA is not available in this runtime.")
+
     if device.type == "cuda":
         gpu = torch.cuda.get_device_name(0)
         cc = torch.cuda.get_device_capability(0)
         print(f"[runtime] GPU={gpu}, capability={cc[0]}.{cc[1]}")
-        if "P100" in gpu.upper() or cc[0] < 8:
-            if args.dtype != "fp16":
-                print("[runtime] P100/pre-Ampere detected, switching dtype to fp16")
-                args.dtype = "fp16"
-            if args.train_batch_size > 1:
-                print("[runtime] P100 memory warning: use --train-batch-size 1 and increase --grad-accum")
+
+        if cc[0] < 8 and args.dtype != "fp16":
+            print("[runtime] pre-Ampere GPU detected, switching dtype to fp16")
+            args.dtype = "fp16"
+
+        if args.train_batch_size > 1:
+            print("[runtime] memory warning: use --train-batch-size 1 if you get OOM")
+
     return device, get_dtype(args.dtype)
 
 
@@ -147,21 +133,17 @@ def normalize(text: str):
     return " ".join(str(text).strip().lower().split())
 
 
-def load_split(name: str, split: str, cache_dir: str | None, streaming: bool = False):
-    spec = OFFICIAL[name]
-    kwargs = {"split": split, "streaming": streaming}
+def load_parquet_stream(files, cache_dir: str | None):
+    kwargs = {
+        "data_files": files,
+        "split": "train",
+        "streaming": True,
+    }
     if cache_dir:
         kwargs["cache_dir"] = cache_dir
 
-    if spec["config"]:
-        ds = load_dataset(spec["path"], spec["config"], **kwargs)
-    else:
-        ds = load_dataset(spec["path"], **kwargs)
-
+    ds = load_dataset("parquet", **kwargs)
     ds = ds.cast_column("audio", Audio(sampling_rate=SAMPLE_RATE))
-
-    if spec["text"] != "text":
-        ds = ds.rename_column(spec["text"], "text")
 
     keep = {"audio", "text"}
     drop = [c for c in ds.column_names if c not in keep]
@@ -171,52 +153,25 @@ def load_split(name: str, split: str, cache_dir: str | None, streaming: bool = F
     return ds
 
 
-def maybe_take(ds, n: int | None, seed: int, shuffle: bool):
-    if shuffle:
-        ds = ds.shuffle(seed=seed)
-    if n is None:
-        return ds
-    return ds.select(range(min(n, len(ds))))
-
 def load_train_dataset(args):
-    files = [
-        "hf://datasets/librispeech_asr/clean/train.100/0000.parquet",
-    ]
+    ds = load_parquet_stream(LIBRISPEECH_SMALL_FILES, args.cache_dir)
 
-    ds = load_dataset(
-        "parquet",
-        data_files=files,
-        split="train",
-        streaming=True,
-    )
-
-    ds = ds.cast_column("audio", Audio(sampling_rate=SAMPLE_RATE))
-
-    if args.max_train_samples is not None:
+    if args.shuffle_buffer > 0:
         ds = ds.shuffle(seed=args.seed, buffer_size=args.shuffle_buffer)
-        ds = ds.take(args.max_train_samples)
+
+    ds = ds.take(args.max_train_samples)
 
     sources = ["librispeech_asr clean/train.100/0000.parquet only"]
     return ds, sources
 
 
-def load_eval_dataset(name: str, limit: int | None, args):
-    files = [
-        "hf://datasets/librispeech_asr/clean/test.clean/0000.parquet",
-    ]
+def load_eval_dataset(limit: int, offset: int, args):
+    ds = load_parquet_stream(LIBRISPEECH_SMALL_FILES, args.cache_dir)
 
-    ds = load_dataset(
-        "parquet",
-        data_files=files,
-        split="train",
-        streaming=True,
-    )
+    if offset > 0:
+        ds = ds.skip(offset)
 
-    ds = ds.cast_column("audio", Audio(sampling_rate=SAMPLE_RATE))
-
-    if limit is not None:
-        ds = ds.take(limit)
-
+    ds = ds.take(limit)
     return ds
 
 
@@ -229,6 +184,7 @@ class BatchCollator:
     def __call__(self, items):
         audios = [x["audio"]["array"] for x in items]
         texts = [normalize(x["text"]) for x in items]
+
         features = self.processor.feature_extractor(
             audios,
             sampling_rate=SAMPLE_RATE,
@@ -236,6 +192,7 @@ class BatchCollator:
             return_attention_mask=True,
             return_tensors="pt",
         )
+
         tokens = self.processor.tokenizer(
             texts,
             padding=True,
@@ -243,9 +200,12 @@ class BatchCollator:
             max_length=self.max_label_tokens,
             return_tensors="pt",
         )
+
         labels = tokens.input_ids.masked_fill(tokens.attention_mask.ne(1), -100)
+
         if labels.size(1) > 0 and torch.all(labels[:, 0] == self.bos):
             labels = labels[:, 1:]
+
         return {
             "input_features": features.input_features,
             "attention_mask": getattr(features, "attention_mask", None),
@@ -255,15 +215,15 @@ class BatchCollator:
         }
 
 
-def make_loader(ds, batch_size: int, collator, shuffle: bool, num_workers: int, pin_memory: bool):
+def make_loader(ds, batch_size: int, collator, pin_memory: bool):
     return DataLoader(
         ds,
         batch_size=batch_size,
-        shuffle=shuffle,
+        shuffle=False,
         collate_fn=collator,
-        num_workers=num_workers,
+        num_workers=0,
         pin_memory=pin_memory,
-        persistent_workers=num_workers > 0,
+        persistent_workers=False,
     )
 
 
@@ -301,8 +261,10 @@ def build_models(args, device: torch.device, amp_dtype: torch.dtype):
     if args.gradient_checkpointing:
         student.gradient_checkpointing_enable()
 
-    teacher.to(device=device, dtype=amp_dtype if device.type == "cuda" else torch.float32)
-    student.to(device=device, dtype=amp_dtype if device.type == "cuda" else torch.float32)
+    dtype = amp_dtype if device.type == "cuda" else torch.float32
+    teacher.to(device=device, dtype=dtype)
+    student.to(device=device, dtype=dtype)
+
     return teacher, student
 
 
@@ -310,31 +272,40 @@ def masked_kl(student_logits, teacher_logits, labels, temperature: float):
     mask = labels.ne(-100)
     if not mask.any():
         return student_logits.new_tensor(0.0)
+
     s = F.log_softmax(student_logits.float() / temperature, dim=-1)
     t = F.softmax(teacher_logits.float() / temperature, dim=-1)
     loss = F.kl_div(s, t, reduction="none").sum(dim=-1)
+
     return loss.masked_select(mask).mean() * temperature**2
 
 
 def plot_history(history: dict[str, list[float]], out_path: Path):
     if not history["step"]:
         return
+
     fig, ax = plt.subplots(2, 2, figsize=(12, 8), constrained_layout=True)
+
     ax[0, 0].plot(history["step"], history["loss"], label="loss")
     ax[0, 0].plot(history["step"], history["ce"], label="ce", alpha=0.8)
     ax[0, 0].plot(history["step"], history["kl"], label="kl", alpha=0.8)
     ax[0, 0].set_title("Loss")
     ax[0, 0].legend()
+
     ax[0, 1].plot(history["step"], history["lr"], label="lr")
     ax[0, 1].set_title("LR")
+
     ax[1, 0].plot(history["eval_step"], history["eval_wer"], label="wer")
     ax[1, 0].plot(history["eval_step"], history["eval_cer"], label="cer")
     ax[1, 0].set_title("Eval")
     ax[1, 0].legend()
+
     ax[1, 1].plot(history["step"], history["samples_sec"], label="samples/s")
     ax[1, 1].set_title("Throughput")
+
     for axes in ax.flat:
         axes.grid(alpha=0.25)
+
     fig.savefig(out_path, dpi=160, bbox_inches="tight")
     plt.close(fig)
 
@@ -346,22 +317,28 @@ def save_metrics(history: dict[str, list[float]], out_path: Path):
 def move_batch(batch, device: torch.device):
     x = batch["input_features"].to(device, non_blocking=True)
     y = batch["labels"].to(device, non_blocking=True)
+
     m = batch["attention_mask"]
     if m is not None:
         m = m.to(device, non_blocking=True)
+
     return x, m, y
 
 
 @torch.no_grad()
 def evaluate(model, processor, loader, args, device: torch.device, amp_dtype: torch.dtype, desc: str, warmup: int = 0):
     model.eval()
+
     preds, refs = [], []
     wall, seconds, samples = 0.0, 0.0, 0
+
     for i, batch in enumerate(tqdm(loader, desc=desc, leave=False), start=1):
         x, m, _ = move_batch(batch, device)
+
         if device.type == "cuda":
             torch.cuda.synchronize()
         t0 = time.perf_counter()
+
         with autocast_ctx(device, amp_dtype):
             ids = model.generate(
                 input_features=x,
@@ -372,8 +349,10 @@ def evaluate(model, processor, loader, args, device: torch.device, amp_dtype: to
                 num_beams=1,
                 do_sample=False,
             )
+
         if device.type == "cuda":
             torch.cuda.synchronize()
+
         if i > warmup:
             wall += time.perf_counter() - t0
             decoded = processor.batch_decode(ids, skip_special_tokens=True)
@@ -381,6 +360,7 @@ def evaluate(model, processor, loader, args, device: torch.device, amp_dtype: to
             refs.extend(batch["texts"])
             seconds += sum(batch["seconds"])
             samples += len(batch["texts"])
+
     return {
         "wer": float(wer(refs, preds)) if preds else float("nan"),
         "cer": float(cer(refs, preds)) if preds else float("nan"),
@@ -410,11 +390,10 @@ def make_scheduler(optimizer, total_steps: int, warmup_ratio: float):
 
 def train(teacher, student, processor, train_loader, eval_loader, args, out_dir: Path, device, amp_dtype):
     params = [p for p in student.parameters() if p.requires_grad]
-    if args.streaming:
-        batches_per_epoch = math.ceil(args.max_train_samples / args.train_batch_size)
-        total_steps = max(1, math.ceil(batches_per_epoch / args.grad_accum) * args.epochs)
-    else:
-        total_steps = max(1, math.ceil(len(train_loader) / args.grad_accum) * args.epochs)
+
+    batches_per_epoch = math.ceil(args.max_train_samples / args.train_batch_size)
+    total_steps = max(1, math.ceil(batches_per_epoch / args.grad_accum) * args.epochs)
+
     optimizer = AdamW(params, lr=args.lr, weight_decay=args.weight_decay, betas=(0.9, 0.98))
     scheduler = make_scheduler(optimizer, total_steps, args.warmup_ratio)
     scaler = GradScaler(enabled=device.type == "cuda" and amp_dtype == torch.float16)
@@ -437,13 +416,14 @@ def train(teacher, student, processor, train_loader, eval_loader, args, out_dir:
 
     for epoch in range(args.epochs):
         student.train()
+        max_micro_steps = math.ceil(args.max_train_samples / args.train_batch_size)
+
         for micro_step, batch in enumerate(train_loader, start=1):
-            if args.streaming:
-                max_micro_steps = math.ceil(args.max_train_samples / args.train_batch_size)
-                if micro_step > max_micro_steps:
-                    break
+            if micro_step > max_micro_steps:
+                break
 
             start = time.perf_counter()
+
             x, m, y = move_batch(batch, device)
             dec = shift_tokens_right(y, student.config.pad_token_id, student.config.decoder_start_token_id)
             dec_mask = dec.ne(student.config.pad_token_id).long()
@@ -482,14 +462,14 @@ def train(teacher, student, processor, train_loader, eval_loader, args, out_dir:
             else:
                 scaled.backward()
 
-            is_last_streaming_step = args.streaming and micro_step == math.ceil(args.max_train_samples / args.train_batch_size)
-            is_last_regular_step = (not args.streaming) and micro_step == len(train_loader)
-            is_update_step = micro_step % args.grad_accum == 0 or is_last_streaming_step or is_last_regular_step
+            is_last_step = micro_step == max_micro_steps
+            is_update_step = micro_step % args.grad_accum == 0 or is_last_step
             if not is_update_step:
                 continue
 
             if scaler.is_enabled():
                 scaler.unscale_(optimizer)
+
             grad_norm = torch.nn.utils.clip_grad_norm_(params, args.max_grad_norm)
 
             if scaler.is_enabled():
@@ -540,14 +520,22 @@ def train(teacher, student, processor, train_loader, eval_loader, args, out_dir:
     plot_history(history, out_dir / "live.png")
     save_metrics(history, out_dir / "history.json")
     save_checkpoint(student, processor, out_dir / "final_student")
+
     return history
 
 
 def main():
     args = parse_args()
     device, amp_dtype = resolve_runtime(args)
+
+    if args.eval_offset is None:
+        args.eval_offset = args.max_train_samples
+    if args.latency_offset is None:
+        args.latency_offset = args.max_train_samples + args.max_eval_samples
+
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+
     seed_everything(args.seed)
     (out_dir / "run_config.json").write_text(json.dumps(vars(args), indent=2, ensure_ascii=True), encoding="utf-8")
 
@@ -556,20 +544,20 @@ def main():
     collator = BatchCollator(processor, args.max_label_tokens)
 
     train_ds, train_sources = load_train_dataset(args)
-    eval_ds = load_eval_dataset(args.eval_preset, args.max_eval_samples, args)
-    latency_ds = load_eval_dataset(args.latency_preset, args.max_latency_samples, args)
+    eval_ds = load_eval_dataset(args.max_eval_samples, args.eval_offset, args)
+    latency_ds = load_eval_dataset(args.max_latency_samples, args.latency_offset, args)
 
     pin_memory = device.type == "cuda"
-    train_loader = make_loader(train_ds, args.train_batch_size, collator, True, args.num_workers, pin_memory)
-    eval_loader = make_loader(eval_ds, args.eval_batch_size, collator, False, args.num_workers, pin_memory)
-    latency_loader = make_loader(latency_ds, 1, collator, False, args.num_workers, pin_memory)
+    train_loader = make_loader(train_ds, args.train_batch_size, collator, pin_memory)
+    eval_loader = make_loader(eval_ds, args.eval_batch_size, collator, pin_memory)
+    latency_loader = make_loader(latency_ds, 1, collator, pin_memory)
 
     teacher, student = build_models(args, device, amp_dtype)
 
     print("teacher:", args.teacher_model)
     print("student layers:", args.student_layers)
     print("dtype:", args.dtype)
-    print("recipe: freeze encoder, train decoder + proj_out, loss = CE + KL")
+    print("recipe: direct parquet streaming, freeze encoder, train decoder + proj_out, loss = CE + KL")
     print("train sources:")
     for src in train_sources:
         print("  -", src)
@@ -600,6 +588,7 @@ def main():
             f"teacher | WER={teacher_eval['wer']:.4f} CER={teacher_eval['cer']:.4f} "
             f"latency={teacher_lat['latency_ms']:.2f}ms RTF={teacher_lat['rtf']:.4f}"
         )
+
     print(
         f"student | WER={student_eval['wer']:.4f} CER={student_eval['cer']:.4f} "
         f"latency={student_lat['latency_ms']:.2f}ms RTF={student_lat['rtf']:.4f}"
