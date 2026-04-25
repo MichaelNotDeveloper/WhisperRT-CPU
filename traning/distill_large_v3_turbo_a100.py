@@ -180,7 +180,9 @@ def load_train_dataset(args):
             continue
         try:
             ds = load_split(name, split, args.cache_dir)
-            parts.append(ds)
+            if args.max_train_samples is not None:
+                split = f"{split}[:{args.max_train_samples}]"
+            parts.append(load_split(name, split, args.cache_dir))
             sources.append(f"{name}: {OFFICIAL[name]['path']}/{OFFICIAL[name]['config'] or '-'} ({split})")
         except Exception as exc:
             print(f"[dataset skip] {name}: {exc}")
