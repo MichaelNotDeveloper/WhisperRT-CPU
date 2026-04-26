@@ -123,24 +123,27 @@ def accuracy_counts(logits, labels):
 class OneLayerDecoderHead(nn.Module):
     def __init__(self, decoder):
         super().__init__()
-        self.layer = copy.deepcopy(decoder.layers[-1])
-        self.layer_norm = copy.deepcopy(decoder.layer_norm)
-        if hasattr(self.layer, "layer_idx"):
-            self.layer.layer_idx = 0
-        if hasattr(self.layer, "self_attn"):
-            self.layer.self_attn.layer_idx = 0
-        if hasattr(self.layer, "encoder_attn"):
-            self.layer.encoder_attn.layer_idx = 0
+        self.decoder = copy.deepcopy(decoder)
+        layer = copy.deepcopy(decoder.layers[-1])
+        self.decoder.layers = nn.ModuleList([layer])
+        self.decoder.config.decoder_layers = 1
+        if hasattr(self.decoder, "layerdrop"):
+            self.decoder.layerdrop = 0.0
+        if hasattr(layer, "layer_idx"):
+            layer.layer_idx = 0
+        if hasattr(layer, "self_attn"):
+            layer.self_attn.layer_idx = 0
+        if hasattr(layer, "encoder_attn"):
+            layer.encoder_attn.layer_idx = 0
 
     def forward(self, hidden_states, attention_mask, encoder_hidden_states):
-        hidden_states = self.layer(
-            hidden_states,
+        return self.decoder(
+            inputs_embeds=hidden_states,
             attention_mask=attention_mask,
             encoder_hidden_states=encoder_hidden_states,
+            return_dict=True,
             use_cache=False,
-            output_attentions=False,
-        )[0]
-        return self.layer_norm(hidden_states)
+        ).last_hidden_state
 
 
 class WhisperMTP(nn.Module):
@@ -201,14 +204,6 @@ class WhisperMTP(nn.Module):
             targets.append(target)
         return targets
 
-    def _self_mask(self, decoder_attention_mask, hidden_states):
-        return self.base.model.decoder._prepare_decoder_attention_mask(
-            decoder_attention_mask,
-            decoder_attention_mask.shape,
-            hidden_states,
-            0,
-        )
-
     def forward(self, input_features, attention_mask, decoder_input_ids, decoder_attention_mask):
         encoder_hidden_states = self.encode(input_features, attention_mask)
         decoder_hidden_states = self.base.model.decoder(
@@ -219,11 +214,10 @@ class WhisperMTP(nn.Module):
         ).last_hidden_state
 
         logits = [self.base.proj_out(decoder_hidden_states)]
-        self_mask = self._self_mask(decoder_attention_mask, decoder_hidden_states)
         hidden_states = decoder_hidden_states
 
         for head in self.mtp_heads:
-            hidden_states = head(hidden_states, self_mask, encoder_hidden_states)
+            hidden_states = head(hidden_states, decoder_attention_mask, encoder_hidden_states)
             logits.append(self.base.proj_out(hidden_states))
 
         return logits
@@ -260,12 +254,11 @@ class WhisperMTP(nn.Module):
                 return_dict=True,
             ).last_hidden_state
 
-            self_mask = self._self_mask(decoder_attention_mask, decoder_hidden_states)
             block = [self.base.proj_out(decoder_hidden_states[:, -1, :]).argmax(dim=-1, keepdim=True)]
             hidden_states = decoder_hidden_states
 
             for head in self.mtp_heads:
-                hidden_states = head(hidden_states, self_mask, encoder_hidden_states)
+                hidden_states = head(hidden_states, decoder_attention_mask, encoder_hidden_states)
                 block.append(self.base.proj_out(hidden_states[:, -1, :]).argmax(dim=-1, keepdim=True))
 
             accepted = [block[0]]
