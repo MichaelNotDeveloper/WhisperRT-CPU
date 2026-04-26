@@ -2,6 +2,7 @@ import gc
 import math
 import re
 import time
+import unicodedata
 from dataclasses import dataclass, field
 from functools import wraps
 from pathlib import Path
@@ -11,7 +12,6 @@ import jiwer
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
-from jiwer import Compose, RemoveMultipleSpaces, Strip, ToLowerCase
 
 
 def clean_cache():
@@ -27,10 +27,28 @@ def seed_everything(seed: int):
     torch.backends.cudnn.benchmark = False
 
 
+_WHITESPACE_RE = re.compile(r"\s+")
+
+
+def _normalize_asr_text(text: str) -> str:
+    text = unicodedata.normalize("NFKC", text).lower().replace("ё", "е")
+
+    normalized_chars = []
+    for char in text:
+        category = unicodedata.category(char)
+        if category == "Mn":
+            continue
+        if category.startswith(("P", "S")) or char == "_":
+            normalized_chars.append(" ")
+            continue
+        normalized_chars.append(char)
+
+    return _WHITESPACE_RE.sub(" ", "".join(normalized_chars)).strip()
+
+
 def asr_metrics(hypothesis: str, reference: str) -> dict[str, float]:
-    tr = Compose([ToLowerCase(), RemoveMultipleSpaces(), Strip()])
-    ref_tr = tr(reference)
-    hyp_tr = tr(hypothesis)
+    ref_tr = _normalize_asr_text(reference)
+    hyp_tr = _normalize_asr_text(hypothesis)
     out = jiwer.process_words(ref_tr, hyp_tr)
     wer = out.wer
     cer = jiwer.cer(ref_tr, hyp_tr)
@@ -72,6 +90,7 @@ class BenchmarkResult:
     cer_history: list[float]
     generated_texts: list[str]
     original_texts: list[str]
+    audio_time_ratio: list[float]
     encoder_speed: list[float]
     decoder_speed: list[float]
     processor_speed: list[float] = field(default_factory=list)
@@ -166,7 +185,7 @@ def plot_benchmarks(
         raise ValueError("results is empty")
 
     with plt.style.context("seaborn-v0_8-whitegrid"):
-        fig, axes = plt.subplots(2, 3, figsize=(18, 10), constrained_layout=True)
+        fig, axes = plt.subplots(2, 3, figsize=(18, 11), constrained_layout=True)
         fig.suptitle("Benchmark Comparison", fontsize=16, fontweight="bold")
 
         _plot_metric(
@@ -176,7 +195,6 @@ def plot_benchmarks(
             "WER",
             "Word Error Rate",
             "#4C78A8",
-            lower_is_better=False,
         )
         _plot_metric(
             axes[0, 1],
@@ -185,7 +203,14 @@ def plot_benchmarks(
             "CER",
             "Character Error Rate",
             "#F58518",
-            lower_is_better=False,
+        )
+        _plot_metric(
+            axes[0, 2],
+            results,
+            "audio_time_ratio",
+            "Runtime / Audio Duration (RTF)",
+            "Ratio",
+            "#B279A2",
         )
         _plot_metric(
             axes[1, 0],
@@ -212,7 +237,6 @@ def plot_benchmarks(
             "Seconds per processor call",
             "#72B7B2",
         )
-        axes[0, 2].axis("off")
 
         summary_lines = []
         for name, result in results.items():
@@ -222,22 +246,14 @@ def plot_benchmarks(
                 f"{name}: samples={len(result.wer_history)}, "
                 f"avg generated chars={gen_mean:.1f}, avg reference chars={ref_mean:.1f}"
             )
-        axes[0, 2].set_title("Summary", fontsize=13, fontweight="semibold")
-        axes[0, 2].text(
-            0.02,
-            0.98,
-            "\n".join(summary_lines),
-            ha="left",
+        fig.text(
+            0.5,
+            0.965,
+            " | ".join(summary_lines),
+            ha="center",
             va="top",
             fontsize=9,
-            color="#444444",
-            transform=axes[0, 2].transAxes,
-            bbox={
-                "boxstyle": "round,pad=0.4",
-                "facecolor": "#f7f7f7",
-                "edgecolor": "#d0d0d0",
-                "alpha": 0.95,
-            },
+            color="#555555",
         )
 
         if save_path is not None:
@@ -292,13 +308,13 @@ def _parse_profiler_table(table: str) -> tuple[str, list[tuple[str, float]]]:
 
 
 def plot_profiler_averages(
-    results: dict[str, BenchmarkResult],
+    results: dict[str, BenchmarkResult] | None,
     save_path: str | Path | None = None,
-) -> tuple[plt.Figure, plt.Axes]:
+) -> tuple[plt.Figure | None, plt.Axes | None]:
     """Строит отдельный grouped barplot по среднему времени операций из torch.profiler."""
 
     if not results:
-        raise ValueError("results is empty")
+        return None, None
 
     parsed_results: dict[str, dict[str, float]] = {}
     avg_column_name = None
@@ -313,7 +329,7 @@ def plot_profiler_averages(
                 op_names.append(name)
 
     if not parsed_results or not op_names:
-        raise ValueError("Profiler data is empty or could not be parsed")
+        return None, None
 
     with plt.style.context("seaborn-v0_8-whitegrid"):
         fig_height = max(6, 0.5 * len(op_names) + 2)

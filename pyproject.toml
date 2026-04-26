@@ -7,15 +7,16 @@ requires-python = ">=3.11,<3.13"
 dependencies = [
     "torch",
     "torchaudio",
-    "openai-whisper",
-    "numpy",
-    "soundfile",
-    "tqdm",
-    "jiwer",
-    "datasets",
-    "transformers",
+    "torchvision",
     "torchcodec",
-    "matplotlib"
+    "transformers",
+    "datasets",
+    "numpy",
+    "tqdm",
+    "openai-whisper",
+    "jiwer",
+    "soundfile",
+    "matplotlib",
 ]
 
 [dependency-groups]
