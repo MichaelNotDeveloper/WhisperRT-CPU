@@ -7,7 +7,7 @@ import torch
 import torch.nn as nn
 from torch.profiler import ProfilerActivity, profile, record_function
 from tqdm import tqdm
-from transformers import WhisperProcessor
+from transformers import WhisperFeatureExtractor, WhisperProcessor
 
 from audio_datasets import AudioTextDataset
 from baseline_models import (
@@ -28,21 +28,39 @@ from utils import (
 PRUNED_TURBO_CHECKPOINT = "2DecoderModelWeights"
 
 
+def load_whisper_processor(
+    source: str,
+    expected_feature_size: int | None = None,
+) -> WhisperProcessor:
+    processor = WhisperProcessor.from_pretrained(source)
+
+    if expected_feature_size is None:
+        return processor
+
+    if processor.feature_extractor.feature_size == expected_feature_size:
+        return processor
+
+    feature_kwargs = processor.feature_extractor.to_dict()
+    feature_kwargs["feature_size"] = expected_feature_size
+    feature_extractor = WhisperFeatureExtractor(**feature_kwargs)
+    return WhisperProcessor(feature_extractor=feature_extractor, tokenizer=processor.tokenizer)
+
+
 # Models are expected to expose `model.encoder` and `model.decoder`.
 @dataclass
 class ModelsForBenchmark:
-    BaseWhisper: nn.Module | None = BaselineSmall()()
+    #BaseWhisper: nn.Module | None = BaselineSmall()()
     TurboWhisper: nn.Module | None = BaselineTurboParams()()
-    LargeV3Whisper: nn.Module | None = BaselineLarge()()
-    CompileWhipser: nn.Module | None = TorchCompileTurboParams()()
+    #LargeV3Whisper: nn.Module | None = BaselineLarge()()
+    #CompileWhipser: nn.Module | None = TorchCompileTurboParams()()
     PrunedTurbo2Decoder: nn.Module | None = PrunedTurboDecoder(PRUNED_TURBO_CHECKPOINT)()
 
 @dataclass
 class ProcessingOptions:
-    BaseWhisper: str = "openai/whisper-base"
+    #BaseWhisper: str = "openai/whisper-base"
     TurboWhisper: str = "openai/whisper-large-v3-turbo"
-    LargeV3Whisper: str = "openai/whisper-large-v3"
-    CompileWhipser: str = "openai/whisper-large-v3-turbo"
+    #LargeV3Whisper: str = "openai/whisper-large-v3"
+    #CompileWhipser: str = "openai/whisper-large-v3-turbo"
     PrunedTurbo2Decoder: str = PRUNED_TURBO_CHECKPOINT
 
 class Benchmark:
@@ -71,8 +89,14 @@ class Benchmark:
             self.models[field.name] = getattr(ModelsForBenchmark, field.name)
 
         for field in fields(ProcessingOptions):
-            self.processors[field.name] = WhisperProcessor.from_pretrained(
-                getattr(ProcessingOptions, field.name)
+            processor_source = getattr(ProcessingOptions, field.name)
+            expected_feature_size = None
+            if field.name == "PrunedTurbo2Decoder":
+                expected_feature_size = self.models[field.name].config.num_mel_bins
+
+            self.processors[field.name] = load_whisper_processor(
+                processor_source,
+                expected_feature_size=expected_feature_size,
             )
 
         for model in self.models.values():
@@ -211,16 +235,16 @@ if __name__ == "__main__":
         device="CPU",
         profiler=False
     )
-    results_small = bench.run("BaseWhisper", sample_size=20)
+    #results_small = bench.run("BaseWhisper", sample_size=20)
     results_base = bench.run("TurboWhisper", sample_size=20)
-    results_large_v3 = bench.run("LargeV3Whisper", sample_size=20)
-    results_large = bench.run("CompileWhipser", sample_size=20)
+    #results_large_v3 = bench.run("LargeV3Whisper", sample_size=20)
+    #results_large = bench.run("CompileWhipser", sample_size=20)
     results_pruned = bench.run("PrunedTurbo2Decoder", sample_size=20, print_predictions=True)
     results = {
-        "BaseWhisper": results_small,
+        #"BaseWhisper": results_small,
         "TurboWhisper": results_base,
-        "LargeV3Whisper": results_large_v3,
-        "CompileWhipser": results_large,
+        #"LargeV3Whisper": results_large_v3,
+        #"CompileWhipser": results_large,
         "PrunedTurbo2Decoder": results_pruned,
     }
     plot_benchmarks(results, "./plots.png")
