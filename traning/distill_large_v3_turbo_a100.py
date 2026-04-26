@@ -5,8 +5,8 @@ import copy
 import json
 import math
 import random
+import sys
 import time
-import warnings
 from contextlib import nullcontext
 from pathlib import Path
 
@@ -69,7 +69,13 @@ def parse_args():
     p.add_argument("--shuffle-buffer", type=int, default=256)
 
     p.add_argument("--max-label-tokens", type=int, default=128)
-    p.add_argument("--max-new-tokens", type=int, default=192)
+    p.add_argument(
+        "--max-gen-length",
+        type=int,
+        default=0,
+        help="Total decoder length for eval/generation. 0 uses the model ceiling.",
+    )
+    p.add_argument("--max-new-tokens", type=int, default=0, help=argparse.SUPPRESS)
 
     p.add_argument("--eval-every", type=int, default=50)
     p.add_argument("--plot-every", type=int, default=25)
@@ -80,6 +86,7 @@ def parse_args():
     p.add_argument("--gradient-checkpointing", action="store_true")
     p.add_argument("--cpu-fallback", action="store_true")
     p.add_argument("--skip-final-teacher-eval", action="store_true")
+    p.add_argument("--no-progress", action="store_true")
 
     return p.parse_args()
 
@@ -159,6 +166,25 @@ def autocast_ctx(device: torch.device, dtype: torch.dtype):
     if device.type == "cuda" and dtype == torch.float16:
         return torch.autocast(device_type="cuda", dtype=torch.float16)
     return nullcontext()
+
+
+def progress_enabled(args):
+    return not args.no_progress and sys.stderr.isatty()
+
+
+def resolve_generation_length(model, processor, args):
+    model_ceiling = getattr(model.config, "max_target_positions", None) or model.generation_config.max_length
+
+    if args.max_gen_length and args.max_gen_length > 0:
+        return min(args.max_gen_length, model_ceiling) if model_ceiling else args.max_gen_length
+
+    if args.max_new_tokens and args.max_new_tokens > 0:
+        prompt_ids = processor.get_decoder_prompt_ids(language=args.language, task=args.task)
+        prompt_len = 1 + max((position for position, _ in prompt_ids), default=0)
+        target_len = prompt_len + args.max_new_tokens
+        return min(target_len, model_ceiling) if model_ceiling else target_len
+
+    return model_ceiling
 
 
 def normalize(text: str):
@@ -433,13 +459,16 @@ def move_batch(batch, device: torch.device):
 def evaluate(model, processor, loader, args, device: torch.device, amp_dtype: torch.dtype, desc: str, warmup: int = 0):
     model.eval()
     generation_config = copy.deepcopy(model.generation_config)
-    generation_config.max_length = None
-    generation_config.max_new_tokens = args.max_new_tokens
+    generation_config.max_new_tokens = None
+    generation_config.max_length = resolve_generation_length(model, processor, args)
 
     preds, refs = [], []
     wall, seconds, samples = 0.0, 0.0, 0
 
-    for i, batch in enumerate(tqdm(loader, desc=desc, leave=False), start=1):
+    for i, batch in enumerate(
+        tqdm(loader, desc=desc, leave=False, disable=not progress_enabled(args), mininterval=5.0),
+        start=1,
+    ):
         x, m, _ = move_batch(batch, device)
 
         if device.type == "cuda":
@@ -447,20 +476,15 @@ def evaluate(model, processor, loader, args, device: torch.device, amp_dtype: to
         t0 = time.perf_counter()
 
         with autocast_ctx(device, amp_dtype):
-            with warnings.catch_warnings():
-                warnings.filterwarnings(
-                    "ignore",
-                    message=r"Both `max_new_tokens` .* `max_length`.*",
-                )
-                ids = model.generate(
-                    input_features=x,
-                    attention_mask=m,
-                    generation_config=generation_config,
-                    language=args.language,
-                    task=args.task,
-                    num_beams=1,
-                    do_sample=False,
-                )
+            ids = model.generate(
+                input_features=x,
+                attention_mask=m,
+                generation_config=generation_config,
+                language=args.language,
+                task=args.task,
+                num_beams=1,
+                do_sample=False,
+            )
 
         if device.type == "cuda":
             torch.cuda.synchronize()
@@ -532,7 +556,12 @@ def train(teacher, student, processor, train_loader, eval_loader, args, out_dir:
 
     optimizer.zero_grad(set_to_none=True)
     global_step = 0
-    pbar = tqdm(total=total_steps, desc="train")
+    pbar = tqdm(
+        total=total_steps,
+        desc="train",
+        disable=not progress_enabled(args),
+        mininterval=5.0,
+    )
 
     for epoch in range(args.epochs):
         student.train()
