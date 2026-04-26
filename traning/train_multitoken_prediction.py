@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from jiwer import cer, wer
 from tqdm.auto import tqdm
 from transformers import WhisperForConditionalGeneration, WhisperProcessor
-from transformers.models.whisper.modeling_whisper import shift_tokens_right
+from transformers.models.whisper.modeling_whisper import _expand_mask, _make_causal_mask, shift_tokens_right
 
 from distill_large_v3_turbo_a100 import (
     BatchCollator,
@@ -58,7 +58,7 @@ def parse_args():
     p.add_argument("--max-grad-norm", type=float, default=1.0)
 
     p.add_argument("--base-ce-weight", type=float, default=1.0)
-    p.add_argument("--mtp-ce-weight", type=float, default=1.0)
+    p.add_argument("--mtp-ce-weight", type=float, default=2.0)
 
     p.add_argument("--max-train-samples", type=int, default=500)
     p.add_argument("--max-eval-samples", type=int, default=32)
@@ -120,15 +120,16 @@ def accuracy_counts(logits, labels):
     return int(correct), int(total)
 
 
+def format_block_accs(block_accs):
+    return " ".join(f"b{i}={acc:.4f}" for i, acc in enumerate(block_accs))
+
+
 class OneLayerDecoderHead(nn.Module):
     def __init__(self, decoder):
         super().__init__()
-        self.decoder = copy.deepcopy(decoder)
-        layer = copy.deepcopy(decoder.layers[-1])
-        self.decoder.layers = nn.ModuleList([layer])
-        self.decoder.config.decoder_layers = 1
-        if hasattr(self.decoder, "layerdrop"):
-            self.decoder.layerdrop = 0.0
+        self.layer = copy.deepcopy(decoder.layers[-1])
+        self.layer_norm = copy.deepcopy(decoder.layer_norm)
+        layer = self.layer
         if hasattr(layer, "layer_idx"):
             layer.layer_idx = 0
         if hasattr(layer, "self_attn"):
@@ -137,13 +138,28 @@ class OneLayerDecoderHead(nn.Module):
             layer.encoder_attn.layer_idx = 0
 
     def forward(self, hidden_states, attention_mask, encoder_hidden_states):
-        return self.decoder(
-            inputs_embeds=hidden_states,
-            attention_mask=attention_mask,
+        input_shape = hidden_states.shape[:2]
+        combined_attention_mask = None
+        if input_shape[-1] > 1:
+            combined_attention_mask = _make_causal_mask(
+                input_shape,
+                hidden_states.dtype,
+                device=hidden_states.device,
+                past_key_values_length=0,
+            )
+        if attention_mask is not None:
+            expanded_attn_mask = _expand_mask(attention_mask, hidden_states.dtype, tgt_len=input_shape[-1])
+            combined_attention_mask = (
+                expanded_attn_mask if combined_attention_mask is None else expanded_attn_mask + combined_attention_mask
+            )
+        hidden_states = self.layer(
+            hidden_states,
+            attention_mask=combined_attention_mask,
             encoder_hidden_states=encoder_hidden_states,
-            return_dict=True,
             use_cache=False,
-        ).last_hidden_state
+            output_attentions=False,
+        )[0]
+        return self.layer_norm(hidden_states)
 
 
 class WhisperMTP(nn.Module):
@@ -214,11 +230,10 @@ class WhisperMTP(nn.Module):
         ).last_hidden_state
 
         logits = [self.base.proj_out(decoder_hidden_states)]
-        hidden_states = decoder_hidden_states
 
         for head in self.mtp_heads:
-            hidden_states = head(hidden_states, decoder_attention_mask, encoder_hidden_states)
-            logits.append(self.base.proj_out(hidden_states))
+            head_hidden_states = head(decoder_hidden_states, decoder_attention_mask, encoder_hidden_states)
+            logits.append(self.base.proj_out(head_hidden_states))
 
         return logits
 
@@ -255,11 +270,10 @@ class WhisperMTP(nn.Module):
             ).last_hidden_state
 
             block = [self.base.proj_out(decoder_hidden_states[:, -1, :]).argmax(dim=-1, keepdim=True)]
-            hidden_states = decoder_hidden_states
 
             for head in self.mtp_heads:
-                hidden_states = head(hidden_states, decoder_attention_mask, encoder_hidden_states)
-                block.append(self.base.proj_out(hidden_states[:, -1, :]).argmax(dim=-1, keepdim=True))
+                head_hidden_states = head(decoder_hidden_states, decoder_attention_mask, encoder_hidden_states)
+                block.append(self.base.proj_out(head_hidden_states[:, -1, :]).argmax(dim=-1, keepdim=True))
 
             accepted = [block[0]]
             verify_ids = torch.cat([ids, block[0]], dim=-1)
@@ -314,7 +328,7 @@ def plot_history(history: dict[str, list[float]], out_path: Path):
     if not history["step"]:
         return
 
-    fig, ax = plt.subplots(2, 2, figsize=(12, 8), constrained_layout=True)
+    fig, ax = plt.subplots(2, 3, figsize=(15, 8), constrained_layout=True)
 
     ax[0, 0].plot(history["step"], history["loss"], label="loss")
     ax[0, 0].plot(history["step"], history["base_ce"], label="base_ce", alpha=0.8)
@@ -325,15 +339,24 @@ def plot_history(history: dict[str, list[float]], out_path: Path):
     ax[0, 1].plot(history["step"], history["lr"], label="lr")
     ax[0, 1].set_title("LR")
 
+    ax[0, 2].plot(history["step"], history["samples_sec"], label="samples/s")
+    ax[0, 2].set_title("Throughput")
+
     ax[1, 0].plot(history["eval_step"], history["eval_wer"], label="wer")
     ax[1, 0].plot(history["eval_step"], history["eval_cer"], label="cer")
-    ax[1, 0].plot(history["eval_step"], history["eval_base_acc"], label="base_acc")
-    ax[1, 0].plot(history["eval_step"], history["eval_mtp_acc"], label="mtp_acc")
-    ax[1, 0].set_title("Eval")
+    ax[1, 0].set_title("Eval Text")
     ax[1, 0].legend()
 
-    ax[1, 1].plot(history["step"], history["samples_sec"], label="samples/s")
-    ax[1, 1].set_title("Throughput")
+    ax[1, 1].plot(history["eval_step"], history["eval_base_acc"], label="base_acc")
+    ax[1, 1].plot(history["eval_step"], history["eval_mtp_acc"], label="mtp_acc")
+    ax[1, 1].set_title("Eval Accuracy")
+    ax[1, 1].legend()
+
+    for key in sorted(k for k in history if k.startswith("eval_block_acc_")):
+        block_idx = key.rsplit("_", 1)[-1]
+        ax[1, 2].plot(history["eval_step"], history[key], label=f"block_{block_idx}")
+    ax[1, 2].set_title("Block Accuracy")
+    ax[1, 2].legend()
 
     for axes in ax.flat:
         axes.grid(alpha=0.25)
@@ -364,6 +387,8 @@ def evaluate(model, processor, loader, args, device: torch.device, amp_dtype: to
     accepted, proposed = 0, 0
     base_correct, base_total = 0, 0
     mtp_correct, mtp_total = 0, 0
+    block_correct = [0 for _ in range(model.future_tokens + 1)]
+    block_total = [0 for _ in range(model.future_tokens + 1)]
     max_length = resolve_generation_length(model, processor, args)
 
     for i, batch in enumerate(
@@ -385,10 +410,14 @@ def evaluate(model, processor, loader, args, device: torch.device, amp_dtype: to
         correct, total = accuracy_counts(logits_by_horizon[0], targets[0])
         base_correct += correct
         base_total += total
-        for logits, target in zip(logits_by_horizon[1:], targets[1:]):
+        block_correct[0] += correct
+        block_total[0] += total
+        for block_idx, (logits, target) in enumerate(zip(logits_by_horizon[1:], targets[1:]), start=1):
             correct, total = accuracy_counts(logits, target)
             mtp_correct += correct
             mtp_total += total
+            block_correct[block_idx] += correct
+            block_total[block_idx] += total
 
         if device.type == "cuda":
             torch.cuda.synchronize()
@@ -423,6 +452,7 @@ def evaluate(model, processor, loader, args, device: torch.device, amp_dtype: to
         "cer": float(cer(refs, preds)) if preds else float("nan"),
         "base_acc": base_correct / max(base_total, 1),
         "mtp_acc": mtp_correct / max(mtp_total, 1),
+        "block_accs": [correct / max(total, 1) for correct, total in zip(block_correct, block_total)],
         "latency_ms": 1000.0 * wall / max(samples, 1),
         "rtf": wall / max(seconds, 1e-8),
         "accept_ratio": accepted / max(proposed, 1),
@@ -452,6 +482,8 @@ def train(model, processor, train_loader, eval_loader, args, out_dir: Path, devi
         "eval_base_acc": [],
         "eval_mtp_acc": [],
     }
+    for block_idx in range(model.future_tokens + 1):
+        history[f"eval_block_acc_{block_idx}"] = []
 
     optimizer.zero_grad(set_to_none=True)
     global_step = 0
@@ -539,11 +571,14 @@ def train(model, processor, train_loader, eval_loader, args, out_dir: Path, devi
                 history["eval_cer"].append(metrics["cer"])
                 history["eval_base_acc"].append(metrics["base_acc"])
                 history["eval_mtp_acc"].append(metrics["mtp_acc"])
+                for block_idx, acc in enumerate(metrics["block_accs"]):
+                    history[f"eval_block_acc_{block_idx}"].append(acc)
                 model.train()
                 print(
                     f"[step {global_step}] loss={loss.item():.4f} base_ce={base_ce.item():.4f} "
                     f"mtp_ce={mtp_ce.item():.4f} wer={metrics['wer']:.4f} "
                     f"base_acc={metrics['base_acc']:.4f} mtp_acc={metrics['mtp_acc']:.4f} "
+                    f"{format_block_accs(metrics['block_accs'])} "
                     f"grad={float(grad_norm):.3f}"
                 )
             elif global_step % max(1, args.plot_every) == 0:
@@ -628,12 +663,14 @@ def main():
     if student_lat is None:
         print(
             f"mtp | WER={student_eval['wer']:.4f} CER={student_eval['cer']:.4f} "
-            f"base_acc={student_eval['base_acc']:.4f} mtp_acc={student_eval['mtp_acc']:.4f}"
+            f"base_acc={student_eval['base_acc']:.4f} mtp_acc={student_eval['mtp_acc']:.4f} "
+            f"{format_block_accs(student_eval['block_accs'])}"
         )
     else:
         print(
             f"mtp | WER={student_eval['wer']:.4f} CER={student_eval['cer']:.4f} "
             f"base_acc={student_eval['base_acc']:.4f} mtp_acc={student_eval['mtp_acc']:.4f} "
+            f"{format_block_accs(student_eval['block_accs'])} "
             f"latency={student_lat['latency_ms']:.2f}ms RTF={student_lat['rtf']:.4f} "
             f"accept={student_lat['accept_ratio']:.3f}"
         )
