@@ -10,7 +10,13 @@ from tqdm import tqdm
 from transformers import WhisperProcessor
 
 from audio_datasets import AudioTextDataset
-from baseline_models import BaselineTurboParams, PrunedTurboDecoder, TorchCompileTurboParams, BaselineSmall
+from baseline_models import (
+    BaselineLarge,
+    BaselineSmall,
+    BaselineTurboParams,
+    PrunedTurboDecoder,
+    TorchCompileTurboParams,
+)
 from utils import (
     BenchmarkResult,
     ModuleTimer,
@@ -20,7 +26,6 @@ from utils import (
 )
 
 PRUNED_TURBO_CHECKPOINT = "2DecoderModelWeights"
-LOCAL_TURBO_PROCESSOR = PRUNED_TURBO_CHECKPOINT
 
 
 # Models are expected to expose `model.encoder` and `model.decoder`.
@@ -28,15 +33,17 @@ LOCAL_TURBO_PROCESSOR = PRUNED_TURBO_CHECKPOINT
 class ModelsForBenchmark:
     BaseWhisper: nn.Module | None = BaselineSmall()()
     TurboWhisper: nn.Module | None = BaselineTurboParams()()
+    LargeV3Whisper: nn.Module | None = BaselineLarge()()
     CompileWhipser: nn.Module | None = TorchCompileTurboParams()()
     PrunedTurbo2Decoder: nn.Module | None = PrunedTurboDecoder(PRUNED_TURBO_CHECKPOINT)()
 
 @dataclass
 class ProcessingOptions:
-    BaseWhisper: Any = WhisperProcessor.from_pretrained("openai/whisper-base")
-    TurboWhisper: Any = WhisperProcessor.from_pretrained(LOCAL_TURBO_PROCESSOR)
-    CompileWhipser: Any = WhisperProcessor.from_pretrained(LOCAL_TURBO_PROCESSOR)
-    PrunedTurbo2Decoder: Any = WhisperProcessor.from_pretrained(PRUNED_TURBO_CHECKPOINT)
+    BaseWhisper: str = "openai/whisper-base"
+    TurboWhisper: str = "openai/whisper-large-v3-turbo"
+    LargeV3Whisper: str = "openai/whisper-large-v3"
+    CompileWhipser: str = "openai/whisper-large-v3-turbo"
+    PrunedTurbo2Decoder: str = PRUNED_TURBO_CHECKPOINT
 
 class Benchmark:
     def __init__(
@@ -64,7 +71,9 @@ class Benchmark:
             self.models[field.name] = getattr(ModelsForBenchmark, field.name)
 
         for field in fields(ProcessingOptions):
-            self.processors[field.name] = getattr(ProcessingOptions, field.name)
+            self.processors[field.name] = WhisperProcessor.from_pretrained(
+                getattr(ProcessingOptions, field.name)
+            )
 
         for model in self.models.values():
             model = model.to(self.device)
@@ -204,11 +213,13 @@ if __name__ == "__main__":
     )
     results_small = bench.run("BaseWhisper", sample_size=20)
     results_base = bench.run("TurboWhisper", sample_size=20)
+    results_large_v3 = bench.run("LargeV3Whisper", sample_size=20)
     results_large = bench.run("CompileWhipser", sample_size=20)
     results_pruned = bench.run("PrunedTurbo2Decoder", sample_size=20, print_predictions=True)
     results = {
         "BaseWhisper": results_small,
         "TurboWhisper": results_base,
+        "LargeV3Whisper": results_large_v3,
         "CompileWhipser": results_large,
         "PrunedTurbo2Decoder": results_pruned,
     }
