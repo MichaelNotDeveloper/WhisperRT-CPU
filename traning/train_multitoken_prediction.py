@@ -504,12 +504,20 @@ def train(model, processor, train_loader, eval_loader, args, out_dir: Path, devi
             grad_norm = torch.nn.utils.clip_grad_norm_(params, args.max_grad_norm)
 
             if scaler.is_enabled():
+                old_scale = scaler.get_scale()
                 scaler.step(optimizer)
                 scaler.update()
+                did_step = scaler.get_scale() >= old_scale
             else:
                 optimizer.step()
+                did_step = True
 
             optimizer.zero_grad(set_to_none=True)
+            if not did_step:
+                accum_start = None
+                accum_samples = 0
+                continue
+
             scheduler.step()
             global_step += 1
             pbar.update(1)
