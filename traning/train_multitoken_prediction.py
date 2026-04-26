@@ -17,7 +17,7 @@ import torch.nn.functional as F
 from jiwer import cer, wer
 from tqdm.auto import tqdm
 from transformers import WhisperForConditionalGeneration, WhisperProcessor
-from transformers.models.whisper.modeling_whisper import _expand_mask, _make_causal_mask, shift_tokens_right
+from transformers.models.whisper.modeling_whisper import shift_tokens_right
 
 from distill_large_v3_turbo_a100 import (
     BatchCollator,
@@ -88,6 +88,26 @@ def parse_args():
     return p.parse_args()
 
 
+def make_causal_mask(input_shape, dtype: torch.dtype, device: torch.device, past_key_values_length: int = 0):
+    bsz, tgt_len = input_shape
+    mask = torch.triu(
+        torch.full((tgt_len, tgt_len), torch.finfo(dtype).min, device=device),
+        diagonal=1,
+    )
+    if past_key_values_length > 0:
+        prefix = torch.zeros((tgt_len, past_key_values_length), dtype=dtype, device=device)
+        mask = torch.cat([prefix, mask], dim=-1)
+    return mask[None, None, :, :].expand(bsz, 1, tgt_len, tgt_len + past_key_values_length)
+
+
+def expand_mask(mask: torch.Tensor, dtype: torch.dtype, tgt_len: int | None = None):
+    bsz, src_len = mask.shape
+    tgt_len = tgt_len if tgt_len is not None else src_len
+    expanded = mask[:, None, None, :].expand(bsz, 1, tgt_len, src_len).to(dtype)
+    inverted = 1.0 - expanded
+    return inverted.masked_fill(inverted.to(torch.bool), torch.finfo(dtype).min)
+
+
 def resolve_generation_length(model, processor, args):
     model_ceiling = getattr(model.base.config, "max_target_positions", None) or model.base.generation_config.max_length
 
@@ -141,14 +161,14 @@ class OneLayerDecoderHead(nn.Module):
         input_shape = hidden_states.shape[:2]
         combined_attention_mask = None
         if input_shape[-1] > 1:
-            combined_attention_mask = _make_causal_mask(
+            combined_attention_mask = make_causal_mask(
                 input_shape,
                 hidden_states.dtype,
                 device=hidden_states.device,
                 past_key_values_length=0,
             )
         if attention_mask is not None:
-            expanded_attn_mask = _expand_mask(attention_mask, hidden_states.dtype, tgt_len=input_shape[-1])
+            expanded_attn_mask = expand_mask(attention_mask, hidden_states.dtype, tgt_len=input_shape[-1])
             combined_attention_mask = (
                 expanded_attn_mask if combined_attention_mask is None else expanded_attn_mask + combined_attention_mask
             )
