@@ -26,6 +26,13 @@ from utils import (
 )
 
 PRUNED_TURBO_CHECKPOINT = "2DecoderModelWeights"
+DEFAULT_TASK = "transcribe"
+DEFAULT_MAX_NEW_TOKENS = 128
+DATASET_LANGUAGES = {
+    "earnings22": "en",
+    "librispeech": "en",
+    "golos": "ru",
+}
 
 
 def load_whisper_processor(
@@ -49,18 +56,18 @@ def load_whisper_processor(
 # Models are expected to expose `model.encoder` and `model.decoder`.
 @dataclass
 class ModelsForBenchmark:
-    #BaseWhisper: nn.Module | None = BaselineSmall()()
+    BaseWhisper: nn.Module | None = BaselineSmall()()
     TurboWhisper: nn.Module | None = BaselineTurboParams()()
-    #LargeV3Whisper: nn.Module | None = BaselineLarge()()
-    #CompileWhipser: nn.Module | None = TorchCompileTurboParams()()
+    LargeV3Whisper: nn.Module | None = BaselineLarge()()
+    CompileWhipser: nn.Module | None = TorchCompileTurboParams()()
     PrunedTurbo2Decoder: nn.Module | None = PrunedTurboDecoder(PRUNED_TURBO_CHECKPOINT)()
 
 @dataclass
 class ProcessingOptions:
-    #BaseWhisper: str = "openai/whisper-base"
+    BaseWhisper: str = "openai/whisper-base"
     TurboWhisper: str = "openai/whisper-large-v3-turbo"
-    #LargeV3Whisper: str = "openai/whisper-large-v3"
-    #CompileWhipser: str = "openai/whisper-large-v3-turbo"
+    LargeV3Whisper: str = "openai/whisper-large-v3"
+    CompileWhipser: str = "openai/whisper-large-v3-turbo"
     PrunedTurbo2Decoder: str = PRUNED_TURBO_CHECKPOINT
 
 class Benchmark:
@@ -76,6 +83,7 @@ class Benchmark:
         self._warmed_up = set()
         self.device = "cpu" if device == "CPU" else "cuda"
         self.dataset = AudioTextDataset(dataset_name)
+        self.language = DATASET_LANGUAGES.get(dataset_name)
         self.profiler_activities = (
             [ProfilerActivity.CPU]
             if device == "CPU"
@@ -84,6 +92,7 @@ class Benchmark:
         self.profiler_state = profiler
         self.profiler = profile(activities=self.profiler_activities, record_shapes=True) if profiler else nullcontext()
         self.record_func = record_function("model_inference") if profiler else nullcontext() 
+        self.measure_module_timing = self.device == "cpu"
 
         for field in fields(ModelsForBenchmark):
             self.models[field.name] = getattr(ModelsForBenchmark, field.name)
@@ -102,6 +111,15 @@ class Benchmark:
         for model in self.models.values():
             model = model.to(self.device)
 
+    def _generate_kwargs(self) -> dict[str, Any]:
+        kwargs: dict[str, Any] = {
+            "task": DEFAULT_TASK,
+            "max_new_tokens": DEFAULT_MAX_NEW_TOKENS,
+        }
+        if self.language is not None:
+            kwargs["language"] = self.language
+        return kwargs
+
     def warmup(self, model_name: str):
         if model_name in self._warmed_up:
             return
@@ -112,10 +130,13 @@ class Benchmark:
 
         model = self.models[model_name]
         processor = self.processors[model_name]
-        encoder_timer = ModuleTimer()
-        decoder_timer = ModuleTimer()
-        original_encoder = encoder_timer.wrap(model.model.encoder)
-        original_decoder = decoder_timer.wrap(model.model.decoder)
+        original_encoder = None
+        original_decoder = None
+        if self.measure_module_timing:
+            encoder_timer = ModuleTimer(device_type=self.device)
+            decoder_timer = ModuleTimer(device_type=self.device)
+            original_encoder = encoder_timer.wrap(model.model.encoder)
+            original_decoder = decoder_timer.wrap(model.model.decoder)
 
         try:
             audio, _ = sample[0]
@@ -129,12 +150,13 @@ class Benchmark:
                 model.generate(
                     input_features=inputs.input_features.to(self.device),
                     attention_mask=inputs.attention_mask.to(self.device),
-                    language="ru",
-                    task="transcribe",
+                    **self._generate_kwargs(),
                 )
         finally:
-            model.model.encoder.forward = original_encoder
-            model.model.decoder.forward = original_decoder
+            if original_encoder is not None:
+                model.model.encoder.forward = original_encoder
+            if original_decoder is not None:
+                model.model.decoder.forward = original_decoder
 
         self._warmed_up.add(model_name)
 
@@ -155,10 +177,13 @@ class Benchmark:
         
         self.warmup(model_name)
 
-        encoder_timer = ModuleTimer()
-        decoder_timer = ModuleTimer()
-        original_encoder = encoder_timer.wrap(model.model.encoder)
-        original_decoder = decoder_timer.wrap(model.model.decoder)
+        encoder_timer = ModuleTimer(device_type=self.device)
+        decoder_timer = ModuleTimer(device_type=self.device)
+        original_encoder = None
+        original_decoder = None
+        if self.measure_module_timing:
+            original_encoder = encoder_timer.wrap(model.model.encoder)
+            original_decoder = decoder_timer.wrap(model.model.decoder)
         processor_speed = []
         try:
             with self.profiler as prof:
@@ -188,8 +213,7 @@ class Benchmark:
                             tokens = model.generate(
                                 input_features=input_features,
                                 attention_mask=attention_mask,
-                                language="en",
-                                task="transcribe",
+                                **self._generate_kwargs(),
                             )
                             result = processor.batch_decode(tokens, skip_special_tokens=True)[0]
                             sample_runtime = time.perf_counter() - sample_start
@@ -206,8 +230,10 @@ class Benchmark:
                             generated_texts.append(result)
                             original_texts.append(text)
         finally:
-            model.model.encoder.forward = original_encoder
-            model.model.decoder.forward = original_decoder
+            if original_encoder is not None:
+                model.model.encoder.forward = original_encoder
+            if original_decoder is not None:
+                model.model.decoder.forward = original_decoder
 
         return BenchmarkResult(
             wer_history=wer_hist,
@@ -235,16 +261,16 @@ if __name__ == "__main__":
         device="CPU",
         profiler=False
     )
-    #results_small = bench.run("BaseWhisper", sample_size=20)
+    results_small = bench.run("BaseWhisper", sample_size=20)
     results_base = bench.run("TurboWhisper", sample_size=20)
-    #results_large_v3 = bench.run("LargeV3Whisper", sample_size=20)
-    #results_large = bench.run("CompileWhipser", sample_size=20)
+    results_large_v3 = bench.run("LargeV3Whisper", sample_size=20)
+    results_large = bench.run("CompileWhipser", sample_size=20)
     results_pruned = bench.run("PrunedTurbo2Decoder", sample_size=20, print_predictions=True)
     results = {
-        #"BaseWhisper": results_small,
+        "BaseWhisper": results_small,
         "TurboWhisper": results_base,
-        #"LargeV3Whisper": results_large_v3,
-        #"CompileWhipser": results_large,
+        "LargeV3Whisper": results_large_v3,
+        "CompileWhipser": results_large,
         "PrunedTurbo2Decoder": results_pruned,
     }
     plot_benchmarks(results, "./plots.png")

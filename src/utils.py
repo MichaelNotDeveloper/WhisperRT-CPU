@@ -59,21 +59,22 @@ def asr_metrics(hypothesis: str, reference: str) -> dict[str, float]:
 
 
 class ModuleTimer:
-    def __init__(self):
+    def __init__(self, device_type: str = "cpu"):
         self.times = []
+        self.device_type = device_type
 
     def wrap(self, module):
         original_forward = module.forward
 
         @wraps(original_forward)
         def timed_forward(*args, **kwargs):
-            if torch.cuda.is_available():
+            if self.device_type == "cuda" and torch.cuda.is_available():
                 torch.cuda.synchronize()
 
             t0 = time.perf_counter()
             out = original_forward(*args, **kwargs)
 
-            if torch.cuda.is_available():
+            if self.device_type == "cuda" and torch.cuda.is_available():
                 torch.cuda.synchronize()
 
             t1 = time.perf_counter()

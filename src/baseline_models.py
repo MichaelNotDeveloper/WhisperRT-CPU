@@ -9,6 +9,9 @@ from transformers import WhisperForConditionalGeneration
 class BaselineSmall:
     def __init__(self):
         self.model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-base").to(dtype=torch.float32)
+        self.model.generation_config.do_sample = False
+        self.model.generation_config.return_timestamps = False
+        self.model.generation_config.use_cache = True
     def __call__(self):
         return self.model
     def get_timer(self):
@@ -17,6 +20,9 @@ class BaselineSmall:
 class BaselineTurbo:
     def __init__(self):
         self.model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-large-v3-turbo").to(dtype=torch.float32)
+        self.model.generation_config.do_sample = False
+        self.model.generation_config.return_timestamps = False
+        self.model.generation_config.use_cache = True
     def __call__(self):
         return self.model
     def get_timer(self):
@@ -25,6 +31,9 @@ class BaselineTurbo:
 class BaselineLarge:
     def __init__(self):
         self.model = WhisperForConditionalGeneration.from_pretrained("openai/whisper-large-v3").to(dtype=torch.float32)
+        self.model.generation_config.do_sample = False
+        self.model.generation_config.return_timestamps = False
+        self.model.generation_config.use_cache = True
     def __call__(self):
         return self.model
     def get_timer(self):
