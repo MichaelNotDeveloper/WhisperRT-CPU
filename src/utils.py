@@ -94,7 +94,12 @@ class BenchmarkResult:
     audio_time_ratio: list[float]
     encoder_speed: list[float]
     decoder_speed: list[float]
+    full_generation_step_speed: list[float] = field(default_factory=list)
     processor_speed: list[float] = field(default_factory=list)
+    successful_predictions: list[int] = field(default_factory=list)
+    proposed_predictions: list[int] = field(default_factory=list)
+    prediction_success_ratio: list[float] = field(default_factory=list)
+    speculative_steps: list[int] = field(default_factory=list)
     profiler: Any = None
 
 
@@ -233,9 +238,9 @@ def plot_benchmarks(
         _plot_metric(
             axes[1, 2],
             results,
-            "processor_speed",
-            "Processor Speed",
-            "Seconds per processor call",
+            "full_generation_step_speed",
+            "Full Generation Step Speed",
+            "Seconds per full generation step",
             "#72B7B2",
         )
 
@@ -243,10 +248,18 @@ def plot_benchmarks(
         for name, result in results.items():
             gen_mean, _ = _text_stats(result.generated_texts)
             ref_mean, _ = _text_stats(result.original_texts)
-            summary_lines.append(
+            summary = (
                 f"{name}: samples={len(result.wer_history)}, "
                 f"avg generated chars={gen_mean:.1f}, avg reference chars={ref_mean:.1f}"
             )
+            proposed_total = sum(result.proposed_predictions)
+            if proposed_total > 0:
+                successful_total = sum(result.successful_predictions)
+                summary += (
+                    f", mtp_success={successful_total}/{proposed_total} "
+                    f"({successful_total / proposed_total:.1%})"
+                )
+            summary_lines.append(summary)
         fig.text(
             0.5,
             0.965,
